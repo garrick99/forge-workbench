@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# Workbench output
+results/
+stress_runs/
+_fuzz/
+
+# Local scratch
+_tmp_*
+*.cubin
+
+# OS junk
+.DS_Store
+Thumbs.db

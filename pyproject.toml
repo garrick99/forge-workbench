@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "forge-workbench"
+version = "0.1.0"
+description = "Cross-stack tooling for the Forge / OpenCUDA / OpenPTXas / VortexSTARK toolchain — run, benchmark, compare, and trend GPU kernels across backends."
+requires-python = ">=3.11"
+authors = [{ name = "Garrick Wagner", email = "garrick.wagner@gmail.com" }]
+readme = "README.md"
+license = { file = "LICENSE" }
+
+dependencies = [
+    # OpenPTXas is the primary backend. Workbench imports its sass/* and
+    # benchmarks/bench_util modules directly. Pinned to a path dep for now;
+    # switch to a version range once OpenPTXas tags releases.
+    "openptxas",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-xdist"]
+
+[project.scripts]
+workbench = "workbench.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["workbench*"]
