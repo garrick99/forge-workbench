@@ -4752,6 +4752,1172 @@ def _cmd_hazard_scan(args):
     return 0
 
 
+def _cmd_disasm(args):
+    """Decode a hex-encoded SASS instruction (16 bytes) into mnemonic +
+    field breakdown.  Inverse of `encode`.  Useful when staring at raw
+    bytes from a debug log.
+    """
+    hex_str = args.bytes.replace(" ", "").replace(",", "").lower()
+    try:
+        raw = bytes.fromhex(hex_str)
+    except ValueError as e:
+        print(f"workbench disasm: invalid hex: {e}", file=sys.stderr)
+        return 2
+    if len(raw) != 16:
+        print(f"workbench disasm: expected 16 bytes, got {len(raw)}",
+              file=sys.stderr)
+        return 2
+    opcode = (raw[0] | (raw[1] << 8)) & 0xFFF
+    label = _opcode_label(opcode)
+    fields = _decode_ctrl_word(raw[13], raw[14], raw[15])
+
+    print(f"raw bytes : {raw.hex()}")
+    print(f"opcode    : 0x{opcode:03x}  ({label})")
+    print(f"b0..b1    : 0x{raw[0]:02x} 0x{raw[1]:02x}  (opcode field)")
+    print(f"b2 (dest) : R{raw[2]:<3d}" + ("  (RZ)" if raw[2] == 0xff else ""))
+    print(f"b3 (src0) : R{raw[3]:<3d}" + ("  (RZ)" if raw[3] == 0xff else ""))
+    print(f"b4        : 0x{raw[4]:02x}  (src1 reg, or imm low byte for opcode 0x{opcode:03x})")
+    print(f"b5..b7    : 0x{raw[5]:02x} 0x{raw[6]:02x} 0x{raw[7]:02x}  (imm bytes 1-3, or unused)")
+    print(f"b8 (src2) : R{raw[8]:<3d}" + ("  (RZ)" if raw[8] == 0xff else ""))
+    print(f"b9..b12   : 0x{raw[9]:02x} 0x{raw[10]:02x} 0x{raw[11]:02x} 0x{raw[12]:02x}  (modifier / pred)")
+    print(f"ctrl word : b13=0x{raw[13]:02x} b14=0x{raw[14]:02x} b15=0x{raw[15]:02x}")
+    print(f"  decoded :")
+    print(f"    misc  = 0x{fields['misc']:x}     (sequencing counter)")
+    print(f"    wdep  = 0x{fields['wdep']:02x}    (write-dep scoreboard slot)")
+    print(f"    rbar  = 0x{fields['rbar']:02x}    (read barrier wait mask)")
+    print(f"    wbar  = {fields['wbar']}        (write barrier flag)")
+    print(f"    yield = {fields['yield']}        (yield bit)")
+    print(f"    stall = {fields['stall']}        (stall cycles -- ignored on SM_120)")
+    return 0
+
+
+def _cmd_encode(args):
+    """Encode a single SASS instruction by name+fields and print the
+    resulting hex bytes.  Useful for "what would our encoder produce
+    for this opcode?" investigations.
+
+    The encoder dispatches to sass.encoding.sm_120_opcodes by opcode
+    label.  Only the most common opcode shapes are wired here.
+    """
+    op = args.opcode.upper()
+    from sass.encoding.sm_120_opcodes import (
+        encode_iadd3, encode_imad, encode_imad_r_imm, encode_imad_shl_u32,
+        encode_iadd3_imm32, encode_nop, encode_ldcu_64, encode_ldcu_32,
+    )
+
+    def _r(name: str | None) -> int:
+        if name is None or name.upper() == "RZ":
+            return 0xff
+        return int(name.lstrip("R"))
+
+    try:
+        if op == "IADD3":
+            raw = encode_iadd3(_r(args.dest), _r(args.src0),
+                               _r(args.src1), _r(args.src2))
+        elif op == "IMAD":
+            raw = encode_imad(_r(args.dest), _r(args.src0),
+                              _r(args.src1), _r(args.src2))
+        elif op == "IMAD.IMM":
+            if args.imm is None:
+                print("workbench encode: IMAD.IMM requires --imm", file=sys.stderr)
+                return 2
+            raw = encode_imad_r_imm(_r(args.dest), _r(args.src0),
+                                    int(args.imm, 0), _r(args.src2))
+        elif op == "IMAD.SHL":
+            if args.imm is None:
+                print("workbench encode: IMAD.SHL requires --imm (shift)", file=sys.stderr)
+                return 2
+            raw = encode_imad_shl_u32(_r(args.dest), _r(args.src0),
+                                      int(args.imm, 0))
+        elif op == "NOP":
+            raw = encode_nop()
+        else:
+            print(f"workbench encode: unsupported opcode '{args.opcode}'",
+                  file=sys.stderr)
+            print("  supported: IADD3, IMAD, IMAD.IMM, IMAD.SHL, NOP",
+                  file=sys.stderr)
+            return 2
+    except Exception as exc:
+        print(f"workbench encode: encode failed: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"raw : {raw.hex()}")
+    print(f"      {' '.join(f'{b:02x}' for b in raw)}")
+    return 0
+
+
+def _cmd_csv(args):
+    """Export per-kernel metrics from suite_all artifacts as CSV.
+    Default columns: kernel, ours_regs, ours_sass_total, ours_sass_non_nop,
+    ptxas_regs, ptxas_sass_total, ptxas_sass_non_nop, delta_*, correctness, build.
+    """
+    import csv as _csv
+    import glob
+
+    if args.from_path:
+        files = [args.from_path]
+    elif args.all:
+        pattern = os.path.join(args.results_dir, "*_suite_all*.json")
+        files = sorted(glob.glob(pattern))
+    else:
+        pattern = os.path.join(args.results_dir, "*_suite_all*.json")
+        gl = sorted(glob.glob(pattern))
+        if not gl:
+            print(f"workbench csv: no suite_all artifacts in {args.results_dir}",
+                  file=sys.stderr)
+            return 2
+        files = [gl[-1]]
+
+    out = sys.stdout if not args.out else open(args.out, "w", newline="", encoding="utf-8")
+    try:
+        w = _csv.writer(out)
+        w.writerow([
+            "timestamp", "kernel", "build", "correctness",
+            "ours_regs", "ours_sass_total", "ours_sass_non_nop",
+            "ptxas_regs", "ptxas_sass_total", "ptxas_sass_non_nop",
+            "delta_regs", "delta_sass_total", "delta_sass_non_nop",
+        ])
+        for fpath in files:
+            try:
+                with open(fpath, encoding="utf-8") as f:
+                    art = json.load(f)
+            except Exception:
+                continue
+            ts = art.get("timestamp", os.path.basename(fpath))
+            for k in art.get("kernels", []):
+                ours = k.get("ours") or {}
+                ptx = k.get("ptxas") or {}
+                deltas = k.get("deltas") or {}
+                w.writerow([
+                    ts, k.get("kernel", ""),
+                    k.get("build", ""), k.get("correctness", ""),
+                    ours.get("regs", ""), ours.get("sass_total", ""), ours.get("sass_non_nop", ""),
+                    ptx.get("regs", ""), ptx.get("sass_total", ""), ptx.get("sass_non_nop", ""),
+                    deltas.get("regs", ""), deltas.get("sass_total", ""), deltas.get("sass_non_nop", ""),
+                ])
+    finally:
+        if args.out:
+            out.close()
+            print(f"workbench csv: wrote {args.out}", file=sys.stderr)
+    return 0
+
+
+def _cmd_heatmap(args):
+    """Emit an HTML heatmap of all kernels colored by a chosen metric.
+    Single-file self-contained HTML; opens in any browser.
+    """
+    import glob
+    pattern = os.path.join(args.results_dir, "*_suite_all*.json")
+    files = sorted(glob.glob(pattern))
+    if args.limit:
+        files = files[-args.limit:]
+    if not files:
+        print(f"workbench heatmap: no suite_all artifacts in {args.results_dir}",
+              file=sys.stderr)
+        return 2
+
+    artifact_data = []
+    for fpath in files:
+        try:
+            with open(fpath, encoding="utf-8") as f:
+                artifact_data.append((os.path.basename(fpath), json.load(f)))
+        except Exception:
+            continue
+
+    # Build matrix: rows = kernels, cols = artifacts
+    metric = args.metric
+    by_kernel: dict[str, dict[str, float | None]] = {}
+    timestamps: list[str] = []
+    for tag, art in artifact_data:
+        ts = art.get("timestamp", tag)
+        timestamps.append(ts)
+        for k in art.get("kernels", []):
+            kn = k.get("kernel", "")
+            ours = k.get("ours") or {}
+            deltas = k.get("deltas") or {}
+            if metric in ("ours_regs", "ours_sass_non_nop", "ours_sass_total"):
+                v = ours.get(metric.replace("ours_", ""))
+            elif metric.startswith("delta_"):
+                v = deltas.get(metric.replace("delta_", ""))
+            else:
+                v = ours.get(metric)
+            by_kernel.setdefault(kn, {})[ts] = v
+
+    # Determine colour scale
+    all_vals = [v for kvals in by_kernel.values() for v in kvals.values() if v is not None]
+    if not all_vals:
+        print("workbench heatmap: no data for metric", file=sys.stderr)
+        return 2
+    lo, hi = min(all_vals), max(all_vals)
+
+    def _colour(v):
+        if v is None:
+            return "#222"
+        # Diverging scale: <=0 green, =0 neutral, >0 red
+        if hi == lo:
+            return "#888"
+        if v <= 0:
+            t = (v - lo) / max(0 - lo, 1)
+            r = int(50 + (180 - 50) * t)
+            g = 200
+            b = int(50 + (100 - 50) * t)
+        else:
+            t = v / max(hi, 1)
+            r = 220
+            g = int(180 - 100 * t)
+            b = int(80 - 60 * t)
+        return f"rgb({max(0, min(255, r))},{max(0, min(255, g))},{max(0, min(255, b))})"
+
+    rows = []
+    for kn in sorted(by_kernel):
+        kvals = by_kernel[kn]
+        cells = []
+        for ts in timestamps:
+            v = kvals.get(ts)
+            label = "" if v is None else f"{v:+d}" if isinstance(v, int) else f"{v:.1f}"
+            cells.append(f'<td style="background:{_colour(v)};color:#fff;padding:2px 4px;font-size:9px;text-align:center" title="{ts}: {label}">{label}</td>')
+        rows.append(f'<tr><td style="padding:2px 6px;font:10px monospace;color:#ccc;text-align:right">{kn}</td>{"".join(cells)}</tr>')
+
+    out_path = args.out or "heatmap.html"
+    html = f"""<!doctype html><html><body style="background:#111;font-family:sans-serif;color:#ccc;padding:20px">
+<h2 style="color:#fff">workbench heatmap: <code>{metric}</code></h2>
+<p>{len(by_kernel)} kernels × {len(timestamps)} artifacts. range: {lo} .. {hi}.
+oldest: {timestamps[0] if timestamps else '-'}; newest: {timestamps[-1] if timestamps else '-'}.</p>
+<table style="border-collapse:collapse">{''.join(rows)}</table>
+</body></html>"""
+    Path(out_path).write_text(html, encoding="utf-8")
+    print(f"workbench heatmap: wrote {out_path} "
+          f"({len(by_kernel)} kernels × {len(timestamps)} artifacts)")
+    return 0
+
+
+def _cmd_replay(args):
+    """Re-run a saved suite_all artifact's exact compile.  Checks out
+    the openptxas, opencuda, and forge git hashes recorded in the
+    artifact, then runs the suite.
+
+    Defaults to dry-run; pass --execute to actually checkout and run.
+    """
+    if not args.artifact:
+        print("workbench replay: --artifact required", file=sys.stderr)
+        return 2
+    if not Path(args.artifact).exists():
+        print(f"workbench replay: artifact not found: {args.artifact}",
+              file=sys.stderr)
+        return 2
+    with open(args.artifact, encoding="utf-8") as f:
+        art = json.load(f)
+    commits = art.get("commits") or {}
+    print(f"replay: {args.artifact}")
+    print(f"  timestamp:  {art.get('timestamp')}")
+    print(f"  suite:      {art.get('suite')}")
+    print(f"  forge:      {commits.get('forge', '?')}")
+    print(f"  opencuda:   {commits.get('opencuda', '?')}")
+    print(f"  openptxas:  {commits.get('openptxas', '?')}")
+    if not args.execute:
+        print()
+        print("(dry-run; pass --execute to checkout and re-run the suite)")
+        return 0
+
+    # Checkout openptxas to the recorded hash
+    hash_o = commits.get("openptxas")
+    if not hash_o:
+        print("replay: artifact has no openptxas hash", file=sys.stderr)
+        return 1
+    openptxas_dir = STACK_ROOT / "openptxas"
+    print(f"\nchecking out openptxas @ {hash_o} (in {openptxas_dir})...")
+    r = subprocess.run(["git", "rev-parse", "HEAD"],
+                       cwd=str(openptxas_dir), capture_output=True, text=True)
+    saved_head = r.stdout.strip()
+    try:
+        subprocess.check_call(["git", "checkout", "-q", hash_o],
+                              cwd=str(openptxas_dir))
+        # Re-run suite
+        suite = art.get("suite", "all")
+        cmd = [sys.executable, "-m", "workbench", "run",
+               "--suite", suite, "--mode", "correct", "--compare", "ptxas"]
+        result = subprocess.run(cmd)
+        rc = result.returncode
+    finally:
+        # Restore HEAD
+        if saved_head:
+            subprocess.run(["git", "checkout", "-q", saved_head],
+                           cwd=str(openptxas_dir))
+            print(f"\nrestored openptxas to {saved_head[:12]}")
+    return rc
+
+
+def _cmd_flake_check(args):
+    """Run the same kernel many times to detect flaky failures.
+    Reports PASS/FAIL counts and per-run timestamps so intermittent
+    issues surface."""
+    if args.kernel not in KERNELS:
+        print(f"workbench flake-check: unknown kernel '{args.kernel}'",
+              file=sys.stderr)
+        return 2
+    runs = args.runs
+    pass_n = 0
+    fail_n = 0
+    fails: list[tuple[int, str]] = []
+    print(f"flake-check: {args.kernel}, {runs} runs")
+    for i in range(runs):
+        try:
+            r = measure_kernel(args.kernel, mode="correct",
+                               do_compare=False, repeat=1)
+        except Exception as e:
+            fail_n += 1
+            fails.append((i, f"exception: {type(e).__name__}: {e}"))
+            print(f"  run {i+1:>3d}: EXCEPT {type(e).__name__}")
+            continue
+        ok = r.get("correctness") == "PASS" and r.get("build") == "PASS"
+        if ok:
+            pass_n += 1
+            if args.verbose:
+                print(f"  run {i+1:>3d}: PASS")
+        else:
+            fail_n += 1
+            err = r.get("error") or f"correctness={r.get('correctness')} build={r.get('build')}"
+            fails.append((i, err))
+            print(f"  run {i+1:>3d}: FAIL  ({err})")
+    print()
+    print(f"  passes: {pass_n} / {runs}")
+    print(f"  fails:  {fail_n} / {runs}")
+    if fails and not args.verbose:
+        print("  (re-run with --verbose to see passing runs too)")
+    return 0 if fail_n == 0 else 1
+
+
+def _cmd_search(args):
+    """Search the corpus for kernels emitting a specific opcode or
+    regex-pattern of opcodes.  Returns kernel + position list.
+    """
+    target_opcode = None
+    if args.opcode:
+        # Accept "IADD3" / "IADD3.UR" / "0x210" / "0xc11"
+        s = args.opcode.upper()
+        if s.startswith("0X"):
+            target_opcode = int(s, 16)
+        else:
+            # Reverse-lookup label; build a label->opcode map from _opcode_label hits.
+            mapping = {}
+            for opc in range(0x1000):
+                lbl = _opcode_label(opc)
+                if not lbl.startswith("OP_"):
+                    mapping[lbl] = opc
+            if s not in mapping:
+                print(f"workbench search: unknown opcode label '{args.opcode}'",
+                      file=sys.stderr)
+                print(f"  known: {', '.join(sorted(mapping)[:20])}...", file=sys.stderr)
+                return 2
+            target_opcode = mapping[s]
+
+    pattern_regex = None
+    if args.pattern:
+        pattern_regex = re.compile(args.pattern, re.IGNORECASE)
+
+    target_kernels = (args.kernels.split(",") if args.kernels
+                      else sorted(KERNELS))
+    target_kernels = [k for k in target_kernels if k in KERNELS]
+
+    hits: list[tuple[str, int, str]] = []
+    examined = skipped = 0
+    for name in target_kernels:
+        pair = _disasm_kernel_pair(name)
+        if pair is None:
+            skipped += 1
+            continue
+        ours, _ = pair
+        examined += 1
+        for i, raw in enumerate(ours):
+            opc = _decode_opcode(raw)
+            label = _opcode_label(opc)
+            text = label
+            ok = True
+            if target_opcode is not None:
+                ok = opc == target_opcode
+            if ok and pattern_regex is not None:
+                hexstr = raw.hex()
+                ok = bool(pattern_regex.search(text) or pattern_regex.search(hexstr))
+            if ok:
+                hits.append((name, i, raw.hex()))
+
+    label = (f"opcode={args.opcode}" if args.opcode else "") + \
+            (f" pattern={args.pattern}" if args.pattern else "")
+    print(f"search: {label}")
+    print(f"  examined {examined} kernel(s), skipped {skipped}.")
+    print(f"  {len(hits)} hit(s).")
+    print()
+    grouped: dict[str, list[tuple[int, str]]] = {}
+    for kn, i, hex_ in hits:
+        grouped.setdefault(kn, []).append((i, hex_))
+    for kn in sorted(grouped):
+        positions = grouped[kn]
+        if args.show_bytes:
+            print(f"  {kn:<32s}  {len(positions)} hit(s):")
+            for i, hex_ in positions:
+                print(f"    [{i:>3d}] {hex_}")
+        else:
+            pos_str = ",".join(str(i) for i, _ in positions)
+            print(f"  {kn:<32s}  positions: {pos_str}")
+    return 0
+
+
+def _cmd_opcode_info(args):
+    """Print everything we know about a SASS opcode from the source-of-truth
+    metadata in sass/scoreboard.py and sass/encoding/sm_120_opcodes.py.
+
+    Search keys: the label (IADD3.UR), the alt label with hyphen
+    (IADD3.R-UR — source-style), and the numeric opcode (0xc11).
+    """
+    label = args.opcode.upper()
+    # Reverse-resolve numeric opcode for the hex search.
+    label_to_opcode = {}
+    for opc in range(0x1000):
+        lbl = _opcode_label(opc)
+        if not lbl.startswith("OP_"):
+            label_to_opcode[lbl] = opc
+    numeric = label_to_opcode.get(label)
+    # Variant labels we should also search (source files use mixed naming).
+    search_keys = [label]
+    if "." in label:
+        search_keys.append(label.replace(".", ".R-"))  # e.g. IADD3.UR -> IADD3.R-UR
+    if numeric is not None:
+        search_keys.append(f"0x{numeric:x}")
+        search_keys.append(f"0x{numeric:03x}")
+
+    s = STACK_ROOT / "openptxas"
+    paths = [
+        s / "sass" / "scoreboard.py",
+        s / "sass" / "encoding" / "sm_120_opcodes.py",
+        s / "sass" / "schedule.py",
+        s / "sass" / "isel.py",
+    ]
+    print(f"opcode-info: {label}  (searching for: {', '.join(search_keys)})")
+    print()
+    for p in paths:
+        if not p.exists():
+            continue
+        text = p.read_text(encoding="utf-8")
+        hits = []
+        for i, line in enumerate(text.splitlines()):
+            if any(k in line for k in search_keys):
+                hits.append((i + 1, line))
+        if hits:
+            print(f"=== {p.name} ({len(hits)} mention(s)) ===")
+            for ln, line in hits[:30]:
+                print(f"  L{ln}: {line.rstrip()[:120]}")
+            print()
+    return 0
+
+
+def _cmd_pass_info(args):
+    """Print everything we know about a pipeline pass from source comments
+    in sass/pipeline.py and sass/scoreboard.py."""
+    name = args.pass_name
+    s = STACK_ROOT / "openptxas"
+    candidate_paths = [
+        s / "sass" / "pipeline.py",
+        s / "sass" / "scoreboard.py",
+        s / "sass" / "schedule.py",
+        s / "sass" / "isel.py",
+        s / "sass" / "regalloc.py",
+        s / "sass" / "compact.py",
+    ]
+    print(f"pass-info: {name}")
+    for p in candidate_paths:
+        if not p.exists():
+            continue
+        text = p.read_text(encoding="utf-8")
+        lines = text.splitlines()
+        hits = [(i + 1, line) for i, line in enumerate(lines)
+                if name.upper() in line.upper()]
+        if hits:
+            print(f"\n=== {p.name} ({len(hits)} mentions) ===")
+            for ln, line in hits[:25]:
+                print(f"  L{ln}: {line.rstrip()[:120]}")
+    return 0
+
+
+def _cmd_field_info(args):
+    """Print the layout, semantics, and example values for an
+    instruction-field name (wdep / rbar / stall / etc).
+    """
+    name = args.field.lower()
+    docs = {
+        "wdep": (
+            "Write-dependency scoreboard slot (bits[9:4] of ctrl word).",
+            [
+                "0x3e: ALU slot — tracks ALU writes for in-order retire ordering.",
+                "0x3f: untracked — write completes asynchronously, no consumer can wait.",
+                "0x31, 0x33: rotating LDC slots.",
+                "0x35: LDG slot — long-latency, paired with rbar=0x09 on consumers.",
+            ],
+        ),
+        "rbar": (
+            "Read barrier wait mask (bits[14:10] of ctrl word). Bit set means "
+            "wait for the corresponding scoreboard slot before reading sources.",
+            [
+                "0x01: no wait (consumer's sources are immediately available).",
+                "0x03: wait on slots 0x31/0x33 (LDC/LDCU consumers).",
+                "0x05: wait on 0x33 only (DSETP / F2F).",
+                "0x09: wait on 0x35 (LDG / ATOMG consumers).",
+                "0x0b: wait on 0x31, 0x33, AND 0x35 (over-conservative).",
+            ],
+        ),
+        "stall": (
+            "Stall-cycles field (bits[22:17] of ctrl word).",
+            [
+                "On SM_120 this field is IGNORED by hardware. Always emit 0.",
+                "Pre-SM_120 hardware used it for explicit pipeline stalls.",
+                "SM_120 stalling is achieved via NOP instructions instead.",
+            ],
+        ),
+        "yield": (
+            "Yield bit (bit 16 of ctrl word).",
+            [
+                "If set, hardware allows another warp to execute before this instruction.",
+                "Used by ptxas to break long-running compute regions.",
+                "Setting on memory-fence-adjacent instructions can affect ordering.",
+            ],
+        ),
+        "wbar": (
+            "Write barrier flag (bit 15 of ctrl word).",
+            [
+                "Set on instructions that must complete before any subsequent.",
+                "Used for explicit fence emission; rare in normal code.",
+            ],
+        ),
+        "misc": (
+            "Misc / sequencing counter (bits[3:0] of ctrl word).",
+            [
+                "Carries a per-opcode-family sequence number.",
+                "Frequently differs between ours and ptxas without semantic effect.",
+                "Hardware-ignored for correctness; used by simulators / tools.",
+            ],
+        ),
+    }
+    if name not in docs:
+        print(f"workbench field-info: unknown field '{args.field}'", file=sys.stderr)
+        print(f"  known: {', '.join(sorted(docs))}", file=sys.stderr)
+        return 2
+    desc, items = docs[name]
+    print(f"field: {name}")
+    print(f"  {desc}")
+    print()
+    for it in items:
+        print(f"  - {it}")
+    return 0
+
+
+def _cmd_bisect(args):
+    """git-bisect across openptxas commits to find which one introduced
+    a regression for a given kernel."""
+    if not args.good or not args.bad:
+        print("workbench bisect: --good and --bad required", file=sys.stderr)
+        return 2
+    openptxas_dir = STACK_ROOT / "openptxas"
+    if not (openptxas_dir / ".git").exists():
+        print(f"workbench bisect: not a git repo: {openptxas_dir}", file=sys.stderr)
+        return 2
+
+    # Save current HEAD for restore.
+    r = subprocess.run(["git", "rev-parse", "HEAD"],
+                       cwd=str(openptxas_dir), capture_output=True, text=True)
+    saved_head = r.stdout.strip()
+
+    # Get commit list good..bad (oldest-first; skip the boundary good commit
+    # itself since we know it's good).
+    r = subprocess.run(
+        ["git", "rev-list", "--reverse", f"{args.good}..{args.bad}"],
+        cwd=str(openptxas_dir), capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"workbench bisect: git rev-list failed: {r.stderr}", file=sys.stderr)
+        return 1
+    commits = r.stdout.strip().splitlines()
+    if not commits:
+        print("workbench bisect: no commits between good..bad", file=sys.stderr)
+        return 2
+
+    metric = args.metric  # 'sass_non_nop' or 'correctness'
+
+    def _score(commit: str) -> float | str | None:
+        subprocess.run(["git", "checkout", "-q", commit],
+                       cwd=str(openptxas_dir), capture_output=True)
+        try:
+            r = measure_kernel(args.kernel, mode="correct",
+                               do_compare=True, repeat=1)
+        except Exception as e:
+            return f"EXCEPT:{type(e).__name__}"
+        if metric == "correctness":
+            return r.get("correctness")
+        deltas = r.get("deltas") or {}
+        v = deltas.get(metric)
+        if v is None:
+            ours = r.get("ours") or {}
+            v = ours.get(metric)
+        return v
+
+    print(f"bisect: kernel={args.kernel} metric={metric}")
+    print(f"  good: {args.good}  bad: {args.bad}  ({len(commits)} commits in range)")
+    print()
+    try:
+        # Linear scan (binary search would require an ordered metric, which
+        # 'correctness' isn't; for sass_non_nop it could regress and recover.
+        # Linear is more robust for exploration).  For larger ranges we'd
+        # promote to git bisect proper.
+        last_score = _score(args.good)
+        print(f"  {args.good[:12]} (good): {metric}={last_score}")
+        for c in commits:
+            score = _score(c)
+            flipped = (score != last_score)
+            marker = "**FLIP**" if flipped else "        "
+            print(f"  {c[:12]} {marker}  {metric}={score}")
+            if flipped and args.first_flip:
+                # Show the commit summary
+                r = subprocess.run(["git", "log", "-1", "--oneline", c],
+                                   cwd=str(openptxas_dir), capture_output=True, text=True)
+                print(f"     {r.stdout.strip()}")
+                if args.metric == "correctness" and score == "FAIL":
+                    print(f"  -> first regressing commit (correctness): {c}")
+                    return 0
+            last_score = score
+    finally:
+        if saved_head:
+            subprocess.run(["git", "checkout", "-q", saved_head],
+                           cwd=str(openptxas_dir), capture_output=True)
+            print(f"\nrestored openptxas to {saved_head[:12]}")
+    return 0
+
+
+def _cmd_profile(args):
+    """Measure actual GPU runtime for a kernel and report alongside
+    static metrics.  Uses workbench.measure_kernel in 'bench' mode.
+    """
+    if args.kernel not in KERNELS:
+        print(f"workbench profile: unknown kernel '{args.kernel}'", file=sys.stderr)
+        return 2
+    repeat = args.repeat
+    print(f"profile: {args.kernel}  ({repeat} repeats)")
+    try:
+        r = measure_kernel(args.kernel, mode="bench",
+                           do_compare=True, repeat=repeat)
+    except Exception as e:
+        print(f"workbench profile: measure failed: {type(e).__name__}: {e}",
+              file=sys.stderr)
+        return 1
+    ours = r.get("ours") or {}
+    ptx = r.get("ptxas") or {}
+    print()
+    print(f"  static metrics:")
+    print(f"    {'metric':<14s}  {'ours':>10s}  {'ptxas':>10s}")
+    print(f"    {'-' * 38}")
+    for m in ("regs", "sass_total", "sass_non_nop"):
+        ov = ours.get(m); pv = ptx.get(m)
+        ds = f"{ov - pv:+d}" if (ov is not None and pv is not None) else "-"
+        print(f"    {m:<14s}  {str(ov):>10s}  {str(pv):>10s}  ({ds})")
+    print()
+
+    def _stats(ts):
+        if not ts: return None
+        return {"mean": sum(ts) / len(ts), "min": min(ts), "max": max(ts)}
+
+    o_runs = ours.get("time_ms_runs") or []
+    p_runs = ptx.get("time_ms_runs") or []
+    o_st = _stats(o_runs); p_st = _stats(p_runs)
+    print(f"  runtime (ms):")
+    print(f"    {'metric':<14s}  {'ours':>10s}  {'ptxas':>10s}  speedup")
+    print(f"    {'-' * 50}")
+    for k in ("mean", "min", "max"):
+        ov = (o_st or {}).get(k); pv = (p_st or {}).get(k)
+        if ov is None or pv is None:
+            print(f"    {k:<14s}  {'-':>10s}  {'-':>10s}")
+            continue
+        speed = pv / ov if ov > 0 else float("inf")
+        print(f"    {k:<14s}  {ov:>10.4f}  {pv:>10.4f}  {speed:>5.2f}x")
+    return 0
+
+
+def _cmd_forwarding_candidates(args):
+    """Like hazard-scan but per-kernel verifies each candidate by checking
+    whether ptxas emits the same pair gap=0 in *every* kernel where the
+    pair appears.  Pairs that pass this gate are safe to add to
+    _SCHED_FORWARDING_SAFE without regressions.
+    """
+    target_kernels = sorted(KERNELS)
+    NOP = 0x918
+
+    # First pass: tabulate pair occurrences with surrounding kernel name
+    # so we can per-kernel verify safety.
+    occurrences: dict[tuple[int, int], list[tuple[str, bool, bool]]] = {}
+    examined = skipped = 0
+    for name in target_kernels:
+        pair = _disasm_kernel_pair(name)
+        if pair is None:
+            skipped += 1
+            continue
+        ours, ptxas = pair
+        examined += 1
+
+        def _find_pairs(insns):
+            i = 0
+            while i + 1 < len(insns):
+                opi = _decode_opcode(insns[i])
+                if opi == NOP:
+                    i += 1; continue
+                j = i + 1
+                had_nop = False
+                while j < len(insns) and _decode_opcode(insns[j]) == NOP:
+                    had_nop = True; j += 1
+                if j >= len(insns): break
+                opj = _decode_opcode(insns[j])
+                yield (opi, opj, had_nop)
+                i = j
+
+        # ours_pairs[ (opi, opj) ] = (ours_had_nop, ptxas_had_nop)
+        # For each pair OUR kernel produced, check if PTXAS produced the
+        # same pair somewhere in its emitted SASS.
+        ours_p = list(_find_pairs(ours))
+        ptxas_p = list(_find_pairs(ptxas))
+        ptxas_pair_status: dict[tuple[int, int], bool] = {}
+        for opi, opj, had_nop in ptxas_p:
+            ptxas_pair_status.setdefault((opi, opj), True)
+            if not had_nop:
+                ptxas_pair_status[(opi, opj)] = False  # ptxas has gap=0
+
+        for opi, opj, had_nop in ours_p:
+            ptxas_status = ptxas_pair_status.get((opi, opj))
+            occurrences.setdefault((opi, opj), []).append(
+                (name, had_nop, ptxas_status if ptxas_status is not None else None))
+
+    # Now identify safe candidates: pairs where ours always inserts NOP,
+    # ptxas always emits gap=0, and the pair appears in >= --min-evidence
+    # distinct kernels.
+    min_evidence = args.min_evidence or 3
+    safe = []
+    rejected = []
+    for (opi, opj), occs in occurrences.items():
+        kernels_with_pair = {n for (n, _, _) in occs}
+        if len(kernels_with_pair) < min_evidence:
+            continue
+        ours_always_nop = all(had_nop for (_, had_nop, _) in occs)
+        ptxas_always_no_nop = all(s is False for (_, _, s) in occs if s is not None)
+        ptxas_evidence_count = sum(1 for (_, _, s) in occs if s is not None)
+        ours_no_nop = sum(1 for (_, had_nop, _) in occs if not had_nop)
+
+        if ours_always_nop and ptxas_always_no_nop and ptxas_evidence_count >= min_evidence:
+            safe.append((opi, opj, kernels_with_pair, ptxas_evidence_count))
+        elif ours_always_nop and not ptxas_always_no_nop:
+            rejected.append((opi, opj, kernels_with_pair, ptxas_evidence_count))
+
+    print(f"forwarding-candidates: examined {examined} kernels, "
+          f"min-evidence={min_evidence}")
+    print()
+    print(f"=== SAFE candidates ({len(safe)}): all kernels show ptxas gap=0 ===")
+    if not safe:
+        print("  (none — every promotion-candidate pair has at least one "
+              "kernel where ptxas inserts a NOP)")
+    for opi, opj, kns, n in sorted(safe, key=lambda r: -r[3]):
+        print(f"  ({_opcode_label(opi):<12s}, {_opcode_label(opj):<12s})  "
+              f"in {len(kns)} kernel(s), ptxas-evidence={n}")
+        if args.verbose:
+            print(f"    e.g. {', '.join(sorted(kns)[:5])}")
+    print()
+    print(f"=== REJECTED candidates ({len(rejected)}): mixed ptxas evidence ===")
+    for opi, opj, kns, n in sorted(rejected, key=lambda r: -len(r[2]))[:10]:
+        print(f"  ({_opcode_label(opi):<12s}, {_opcode_label(opj):<12s})  "
+              f"in {len(kns)} kernel(s), ptxas-evidence={n} (not all gap=0)")
+    return 0
+
+
+def _cmd_pattern_mine(args):
+    """Mine common opcode N-grams from ptxas's emitted SASS that don't
+    appear in our output.  Surfaces optimization opportunities at the
+    opcode level.
+    """
+    target_kernels = (args.kernels.split(",") if args.kernels
+                      else sorted(KERNELS))
+    target_kernels = [k for k in target_kernels if k in KERNELS]
+    n = args.n or 3
+
+    NOP = 0x918
+
+    def _ngrams(insns, n_):
+        ops = [_decode_opcode(b) for b in insns
+               if _decode_opcode(b) != NOP]
+        return [tuple(ops[i:i + n_]) for i in range(len(ops) - n_ + 1)]
+
+    ours_total: dict[tuple, int] = {}
+    ptxas_total: dict[tuple, int] = {}
+    examined = skipped = 0
+    for name in target_kernels:
+        pair = _disasm_kernel_pair(name)
+        if pair is None:
+            skipped += 1
+            continue
+        ours, ptxas = pair
+        examined += 1
+        for ng in _ngrams(ours, n):
+            ours_total[ng] = ours_total.get(ng, 0) + 1
+        for ng in _ngrams(ptxas, n):
+            ptxas_total[ng] = ptxas_total.get(ng, 0) + 1
+
+    # ngrams ptxas uses but we never use
+    only_ptxas = []
+    for ng, count in ptxas_total.items():
+        if ng not in ours_total and count >= (args.min_count or 3):
+            only_ptxas.append((count, ng))
+    only_ptxas.sort(reverse=True)
+
+    # ngrams we use but ptxas never uses
+    only_ours = []
+    for ng, count in ours_total.items():
+        if ng not in ptxas_total and count >= (args.min_count or 3):
+            only_ours.append((count, ng))
+    only_ours.sort(reverse=True)
+
+    print(f"pattern-mine: examined {examined} kernels, n={n}, "
+          f"min-count={args.min_count or 3}")
+    print()
+    print(f"=== {len(only_ptxas)} opcode {n}-grams ptxas emits but we don't ===")
+    for count, ng in only_ptxas[:30]:
+        labels = " -> ".join(_opcode_label(o) for o in ng)
+        print(f"  {count:>3d}x  {labels}")
+    print()
+    print(f"=== {len(only_ours)} opcode {n}-grams we emit but ptxas doesn't ===")
+    for count, ng in only_ours[:30]:
+        labels = " -> ".join(_opcode_label(o) for o in ng)
+        print(f"  {count:>3d}x  {labels}")
+    return 0
+
+
+def _cmd_auto_suggest(args):
+    """Analyze why a kernel still has a sass_non_nop GAP and suggest
+    which existing pass could close it.
+
+    Heuristic: trace the kernel's IR after each pass, look for
+    instruction patterns that ANY existing pass should have caught.
+    Report the patterns + which pass theoretically should have applied.
+    """
+    if args.kernel not in KERNELS:
+        print(f"workbench auto-suggest: unknown kernel '{args.kernel}'",
+              file=sys.stderr)
+        return 2
+
+    # Find latest gap for this kernel
+    import glob
+    pattern = os.path.join(args.results_dir, "*_suite_all*.json")
+    files = sorted(glob.glob(pattern))
+    if not files:
+        print("auto-suggest: no artifacts to read", file=sys.stderr)
+        return 2
+    with open(files[-1], encoding="utf-8") as f:
+        art = json.load(f)
+    target = next((k for k in art.get("kernels", []) if k.get("kernel") == args.kernel), None)
+    if not target:
+        print(f"auto-suggest: kernel not in latest artifact", file=sys.stderr)
+        return 2
+    deltas = target.get("deltas") or {}
+    delta_n = deltas.get("sass_non_nop") or 0
+    print(f"auto-suggest: {args.kernel}  current sass_non_nop delta: {delta_n:+d}")
+    if delta_n <= 0:
+        print("  kernel is at PARITY or beats ptxas — no suggestion needed.")
+        return 0
+
+    # Compile both, look for patterns in OURS that PTXAS doesn't have
+    pair = _disasm_kernel_pair(args.kernel)
+    if pair is None:
+        print(f"auto-suggest: compile pair failed", file=sys.stderr)
+        return 1
+    ours, ptxas = pair
+    NOP = 0x918
+
+    suggestions: list[str] = []
+
+    # Heuristic 1: extra IADD3 immediates that look like dead counters
+    iadd3_imm_to_rz = sum(1 for raw in ours
+                          if _decode_opcode(raw) == 0x810 and raw[2] == 0xff)
+    if iadd3_imm_to_rz > 0:
+        suggestions.append(
+            f"  - Found {iadd3_imm_to_rz} `IADD3.IM ... -> RZ` (dead increments). "
+            f"Pass `dead_self_update_dce` should drop these — check why it didn't.")
+
+    # Heuristic 2: many consecutive add.imm in a row → possible imm_add_fold target
+    # (only works on emitted SASS, which is post-fold, so this catches mostly
+    # pattern-shaped issues)
+    consecutive_iadd3 = 0
+    max_consec = 0
+    for raw in ours:
+        op = _decode_opcode(raw)
+        if op in (0x210, 0x810):
+            consecutive_iadd3 += 1
+            max_consec = max(max_consec, consecutive_iadd3)
+        else:
+            consecutive_iadd3 = 0
+    if max_consec >= 3:
+        suggestions.append(
+            f"  - {max_consec} consecutive IADD3-family instructions found. "
+            f"Possible `add_forward_chain` / `imm_add_fold` candidate.")
+
+    # Heuristic 3: redundant cvt+shl pair
+    for i in range(len(ours) - 1):
+        if (_decode_opcode(ours[i]) == 0x205     # CVT
+                and _decode_opcode(ours[i + 1]) == 0x819):  # SHF
+            # Look for a second cvt+shl with same operands later
+            for j in range(i + 2, len(ours) - 1):
+                if (_decode_opcode(ours[j]) == 0x205
+                        and ours[j][3] == ours[i][3]):  # same src
+                    suggestions.append(
+                        f"  - Repeated cvt+shl pair (positions {i} and {j}). "
+                        f"Pass `cvt_shl_cse` may not be running here — check gates.")
+                    break
+            break
+
+    # Heuristic 4: many NOPs (>3 differential)
+    our_nops = sum(1 for r in ours if _decode_opcode(r) == NOP)
+    ptx_nops = sum(1 for r in ptxas if _decode_opcode(r) == NOP)
+    if our_nops > ptx_nops + 3:
+        suggestions.append(
+            f"  - {our_nops - ptx_nops} excess NOPs vs ptxas. "
+            f"Run `workbench hazard-scan --kernels {args.kernel}` and "
+            f"`workbench forwarding-candidates` to find candidates.")
+
+    # Heuristic 5: register pressure
+    ours_regs = (target.get("ours") or {}).get("regs", 0)
+    ptx_regs = (target.get("ptxas") or {}).get("regs", 0)
+    if ours_regs > ptx_regs + 2:
+        suggestions.append(
+            f"  - {ours_regs - ptx_regs} excess GPRs. "
+            f"Look at sass/regalloc.py / sass/compact.py — possible "
+            f"compaction-coverage gap or live-range overlap not collapsed.")
+
+    if not suggestions:
+        print("  No mechanical suggestions; this kernel likely needs a new "
+              "pass or a deeper structural change. Try `kdiff --annotate` "
+              "to see which passes ARE firing.")
+        return 0
+    print(f"  {len(suggestions)} suggestion(s):")
+    print()
+    for s in suggestions:
+        print(s)
+    return 0
+
+
+def _cmd_watch(args):
+    """File-watcher mode: re-run the suite on every save.
+    Polls mtimes on sass/, ptx/, scripts/ at args.interval seconds.
+    """
+    targets = []
+    s = STACK_ROOT / "openptxas"
+    for sub in ("sass", "ptx"):
+        d = s / sub
+        if d.exists():
+            for p in d.rglob("*.py"):
+                targets.append(p)
+    if not targets:
+        print("workbench watch: nothing to watch", file=sys.stderr)
+        return 2
+    print(f"watch: monitoring {len(targets)} files for changes "
+          f"(interval={args.interval}s, suite={args.suite})")
+    print("       press Ctrl-C to stop.")
+
+    last_mt = {p: p.stat().st_mtime for p in targets}
+    try:
+        while True:
+            time.sleep(args.interval)
+            changed = []
+            for p in targets:
+                try:
+                    mt = p.stat().st_mtime
+                except OSError:
+                    continue
+                if mt > last_mt.get(p, 0):
+                    changed.append(p)
+                    last_mt[p] = mt
+            if changed:
+                ts = time.strftime("%H:%M:%S")
+                print(f"\n[{ts}] {len(changed)} file(s) changed:")
+                for p in changed[:5]:
+                    print(f"   {p.relative_to(s)}")
+                cmd = [sys.executable, "-m", "workbench", "run",
+                       "--suite", args.suite or "all", "--mode", "correct",
+                       "--compare", "ptxas"]
+                subprocess.run(cmd)
+    except KeyboardInterrupt:
+        print("\nwatch: stopped.")
+        return 0
+
+
+def _cmd_provenance(args):
+    """Given a 16-byte instruction (hex) and a kernel name, find which
+    PTX-IR instruction it descended from and which passes touched it.
+    """
+    name = args.kernel
+    if name not in KERNELS:
+        print(f"workbench provenance: unknown kernel '{name}'", file=sys.stderr)
+        return 2
+    target_hex = args.bytes.replace(" ", "").replace(",", "").lower()
+    try:
+        target_bytes = bytes.fromhex(target_hex)
+    except ValueError:
+        print(f"workbench provenance: invalid hex bytes", file=sys.stderr)
+        return 2
+    if len(target_bytes) != 16:
+        print(f"workbench provenance: expected 16 bytes, got {len(target_bytes)}",
+              file=sys.stderr)
+        return 2
+
+    entry = KERNELS[name]
+    ptx = entry.get("ptx_inline") or Path(entry["ptx_path"]).read_text(encoding="utf-8")
+    try:
+        cubin, log = _capture_compile_verbose(ptx)
+    except Exception as e:
+        print(f"workbench provenance: compile failed: {e}", file=sys.stderr)
+        return 1
+
+    # Find target instruction in [trace-final] log
+    insn_re = re.compile(r"\[trace-final\]\s*\+\s+(\d+):\s+([0-9a-f]+)\s+//\s*(.*)$")
+    found_pos = None
+    found_comment = ""
+    for line in log.splitlines():
+        m = insn_re.search(line)
+        if not m: continue
+        if m.group(2) == target_hex:
+            found_pos = int(m.group(1)) // 16
+            found_comment = m.group(3)
+            break
+    if found_pos is None:
+        print(f"workbench provenance: bytes not found in {name}'s emitted SASS",
+              file=sys.stderr)
+        return 1
+
+    print(f"provenance: {name}  position={found_pos}  bytes={target_hex}")
+    print()
+    print(f"=== final SASS comment ===")
+    print(f"  {found_comment}")
+    print()
+    print(f"=== passes that touched this instruction ===")
+    found_passes = []
+    for substr, tag in _PASS_MARKERS:
+        if substr in found_comment:
+            found_passes.append(tag)
+    if found_passes:
+        for t in found_passes:
+            print(f"  - {t}")
+    else:
+        print(f"  (no per-instruction pass markers; comment does not carry tags)")
+    print()
+    print(f"=== ctrl word decode ===")
+    fields = _decode_ctrl_word(target_bytes[13], target_bytes[14], target_bytes[15])
+    for k, v in fields.items():
+        print(f"  {k:<6s} = 0x{v:x}" if isinstance(v, int) and v > 9 else f"  {k:<6s} = {v}")
+    return 0
+
+
+def _cmd_forge_trace(args):
+    """Cross-stack trace: Forge .fg source -> emitted PTX -> final SASS.
+    Resolves .fg path against forge/, looks for cached PTX in
+    forge/build/ptx_cache/, and shows each layer."""
+    target = args.target
+    forge_kernels = globals().get("_FORGE_KERNELS", {})
+    if target not in forge_kernels:
+        print(f"workbench forge-trace: unknown target '{target}'", file=sys.stderr)
+        if forge_kernels:
+            print(f"  known: {', '.join(sorted(forge_kernels)[:10])}", file=sys.stderr)
+        return 2
+    entry = forge_kernels[target]
+    forge_root = STACK_ROOT / "forge"
+
+    # .fg source: relative to forge/
+    fg_rel = entry.get("fg_path")
+    fg_full = (forge_root / fg_rel) if fg_rel else None
+
+    print(f"forge-trace: {target}")
+    print(f"  forge root: {forge_root}")
+    print()
+
+    if fg_full and fg_full.exists():
+        print(f"=== Forge source ({fg_rel}) ===")
+        text = fg_full.read_text(encoding="utf-8")
+        for ln, line in enumerate(text.splitlines()[:60], 1):
+            print(f"  L{ln:>3d}: {line}")
+        print()
+    else:
+        print(f"  (no .fg source found at {fg_full})")
+        print()
+
+    # Look for cached PTX in common locations
+    ptx_candidates = [
+        forge_root / "build" / "ptx_cache" / f"{target}.ptx",
+        forge_root / "out" / f"{target}.ptx",
+        forge_root / f"{target}.ptx",
+        STACK_ROOT / "openptxas" / "results" / f"{target}.ptx",
+    ]
+    ptx_path = next((p for p in ptx_candidates if p.exists()), None)
+    if ptx_path:
+        print(f"=== Cached PTX ({ptx_path.relative_to(STACK_ROOT)}) ===")
+        text = ptx_path.read_text(encoding="utf-8")
+        for ln, line in enumerate(text.splitlines()[:60], 1):
+            print(f"  L{ln:>3d}: {line}")
+        print()
+        try:
+            cubin, _ = compile_openptxas(text)
+            symbol = entry.get("kernel_symbol", target)
+            sass = _extract_sass_text(cubin, symbol)
+            print(f"=== SASS via openptxas ({len(sass)} instrs) ===")
+            for line in sass[:40]:
+                print(f"  {line[:100]}")
+        except Exception as e:
+            print(f"  (openptxas compile failed: {type(e).__name__}: {e})")
+    else:
+        print(f"  (no cached PTX found; tried:)")
+        for p in ptx_candidates:
+            print(f"    {p}")
+        print()
+        print(f"  Run `workbench forge run --target {target}` first to "
+              f"populate the cache.")
+    return 0
+
+
+def _cmd_encode_fuzz(args):
+    """Generate every encoding for an opcode under simple constraints,
+    and (if --gpu-test) run each on the GPU to check correctness.
+    Currently supports IMAD with non-pow-2 immediates as a starting
+    point — the bug class that surfaced the FG36 issue.
+    """
+    op = args.opcode.upper()
+    if op != "IMAD":
+        print(f"workbench encode-fuzz: only IMAD supported initially "
+              f"(got '{args.opcode}')", file=sys.stderr)
+        return 2
+
+    from sass.encoding.sm_120_opcodes import encode_imad_r_imm
+    print(f"encode-fuzz: IMAD")
+    print()
+    print(f"  Generating IMAD R{args.dest}, R{args.src0}, K, R{args.src2} "
+          f"for K in {args.imm_range or '1..16'}")
+    print()
+    rng = args.imm_range or "1..16"
+    if ".." in rng:
+        lo, hi = rng.split("..")
+        imms = list(range(int(lo, 0), int(hi, 0) + 1))
+    else:
+        imms = [int(x, 0) for x in rng.split(",")]
+    print(f"  {'imm':>5s}  {'bytes':<32s}  {'note':s}")
+    for k in imms:
+        try:
+            raw = encode_imad_r_imm(args.dest, args.src0, k, args.src2)
+        except Exception as e:
+            print(f"  {k:>5d}  ENCODE FAILED: {e}")
+            continue
+        is_pow2 = k > 0 and (k & (k - 1)) == 0
+        same_dst_src2 = args.dest == args.src2
+        flag = []
+        if is_pow2: flag.append("pow2")
+        if same_dst_src2: flag.append("acc-alias")
+        print(f"  {k:>5d}  {raw.hex()}  {','.join(flag) if flag else ''}")
+    return 0
+
+
 _PTX_PASS_NAMES = (
     "unroll", "load_cse", "add3_chain_reduce", "mul3_chain_reduce",
     "cvt_roundtrip_fold", "add_forward_chain", "bitop_imm_chain_fold",
@@ -5566,6 +6732,236 @@ def main():
     p_grd.add_argument("--results-dir", default=str(DEFAULT_RESULTS_DIR),
                        help="directory to scan for the latest artifact")
 
+    # ---- disasm: decode a 16-byte instruction into fields ----
+    p_disasm = sub.add_parser(
+        "disasm",
+        help="decode 16-byte SASS instruction into mnemonic + fields",
+        description="Inverse of `encode`.  Takes 16 hex bytes and prints "
+                    "opcode, dest/src registers, ctrl-word fields.")
+    p_disasm.add_argument("--bytes", required=True,
+                          help="32 hex chars (16 bytes); spaces allowed")
+
+    # ---- encode: produce 16-byte SASS for a given opcode + fields ----
+    p_encode = sub.add_parser(
+        "encode",
+        help="encode opcode + fields into 16-byte SASS",
+        description="Inverse of `disasm`.  Supports IADD3, IMAD, IMAD.IMM, "
+                    "IMAD.SHL, NOP.  Use to compare our encoder vs ptxas "
+                    "output for a specific opcode shape.")
+    p_encode.add_argument("--opcode", required=True,
+                          help="IADD3 | IMAD | IMAD.IMM | IMAD.SHL | NOP")
+    p_encode.add_argument("--dest", default="RZ", help="dest reg (R0..R254 or RZ)")
+    p_encode.add_argument("--src0", default="RZ", help="src0 reg")
+    p_encode.add_argument("--src1", default="RZ", help="src1 reg (ignored for .IMM)")
+    p_encode.add_argument("--src2", default="RZ", help="src2 reg")
+    p_encode.add_argument("--imm",  default=None,
+                          help="immediate value (hex/dec) for IMM/SHL forms")
+
+    # ---- csv: export artifacts as CSV ----
+    p_csv = sub.add_parser(
+        "csv",
+        help="export per-kernel metrics from suite_all artifacts as CSV",
+        description="Emit CSV rows for plotting.  Default: latest artifact. "
+                    "Use --all for every artifact, --from for a specific one.")
+    p_csv_grp = p_csv.add_mutually_exclusive_group()
+    p_csv_grp.add_argument("--from", dest="from_path", default=None, metavar="PATH")
+    p_csv_grp.add_argument("--all", action="store_true",
+                           help="emit rows for every artifact in results-dir")
+    p_csv.add_argument("--out", default=None, metavar="PATH",
+                       help="write to file (default: stdout)")
+    p_csv.add_argument("--results-dir", default=str(DEFAULT_RESULTS_DIR))
+
+    # ---- heatmap: emit HTML heatmap of metrics across artifacts ----
+    p_hm = sub.add_parser(
+        "heatmap",
+        help="emit HTML heatmap of metric across kernels x artifacts",
+        description="Single-file HTML output that opens in any browser.")
+    p_hm.add_argument("--metric", default="delta_sass_non_nop",
+                      help="metric key (default: delta_sass_non_nop)")
+    p_hm.add_argument("--limit", type=int, default=None,
+                      help="show only the most recent N artifacts")
+    p_hm.add_argument("--out", default=None, metavar="PATH",
+                      help="output HTML path (default: heatmap.html)")
+    p_hm.add_argument("--results-dir", default=str(DEFAULT_RESULTS_DIR))
+
+    # ---- replay: re-run a saved suite_all artifact's exact compile ----
+    p_replay = sub.add_parser(
+        "replay",
+        help="re-run a saved artifact's compile at its pinned git hash",
+        description="Default is dry-run.  --execute does the git checkout "
+                    "and re-runs the suite, restoring HEAD afterward.")
+    p_replay.add_argument("--artifact", required=True, metavar="PATH",
+                          help="path to suite_all.json artifact to replay")
+    p_replay.add_argument("--execute", action="store_true",
+                          help="actually checkout the recorded hash and run "
+                               "(default: dry-run shows the plan)")
+
+    # ---- flake-check: re-run a kernel many times to detect flaky failures ----
+    p_flake = sub.add_parser(
+        "flake-check",
+        help="re-run a single kernel N times to detect flaky failures",
+        description="Watches for kernels that PASS sometimes and FAIL "
+                    "others -- the signature of marginal hardware or "
+                    "non-deterministic compile output.")
+    p_flake.add_argument("--kernel", required=True,
+                         help=f"one of: {', '.join(sorted(KERNELS))}")
+    p_flake.add_argument("--runs", type=int, default=20,
+                         help="number of runs (default: 20)")
+    p_flake.add_argument("--verbose", action="store_true",
+                         help="show every run, not just failures")
+
+    # ---- search: grep emitted SASS by opcode or pattern ----
+    p_search = sub.add_parser(
+        "search",
+        help="search emitted SASS across all kernels for opcode/pattern",
+        description="Find every kernel that emits a specific opcode "
+                    "(--opcode) and/or matches a regex pattern (--pattern).")
+    p_search.add_argument("--opcode", default=None,
+                          help="opcode label (e.g. IADD3.UR) or 0xNNN")
+    p_search.add_argument("--pattern", default=None,
+                          help="regex over opcode label or hex bytes")
+    p_search.add_argument("--kernels", default=None,
+                          help="comma-separated kernel names (default: all)")
+    p_search.add_argument("--show-bytes", action="store_true",
+                          help="print full hex bytes for each hit")
+
+    # ---- opcode-info: show docs/comments for an opcode ----
+    p_oi = sub.add_parser(
+        "opcode-info",
+        help="show source-of-truth docs for a SASS opcode",
+        description="Greps sass/scoreboard.py and sass/encoding/sm_120_opcodes.py "
+                    "for mentions of the opcode label.")
+    p_oi.add_argument("--opcode", required=True,
+                      help="opcode label, e.g. IADD3.UR")
+
+    # ---- pass-info: show docs/comments for a pipeline pass ----
+    p_pi = sub.add_parser(
+        "pass-info",
+        help="show source-of-truth docs for a pipeline pass",
+        description="Greps sass/pipeline.py / scoreboard / schedule / isel "
+                    "for mentions of the pass name (FG33, MP02, TPL01, ...).")
+    p_pi.add_argument("--pass-name", required=True, dest="pass_name",
+                      help="pass name, e.g. FG33 or MP02")
+
+    # ---- field-info: explain instruction-encoding fields ----
+    p_fi = sub.add_parser(
+        "field-info",
+        help="explain wdep / rbar / stall / yield / wbar / misc",
+        description="Print the layout, semantics, and example values "
+                    "for an instruction-encoding field.")
+    p_fi.add_argument("--field", required=True,
+                      help="field name (wdep, rbar, stall, yield, wbar, misc)")
+
+    # ---- bisect: git-bisect across openptxas commits for a kernel ----
+    p_bs = sub.add_parser(
+        "bisect",
+        help="git-bisect openptxas commits to find a regression",
+        description="Linear scan of commits in good..bad range, running the "
+                    "kernel at each commit.  Reports flips of the chosen "
+                    "metric (correctness or sass_non_nop).")
+    p_bs.add_argument("--kernel", required=True,
+                      help=f"one of: {', '.join(sorted(KERNELS))}")
+    p_bs.add_argument("--good", required=True,
+                      help="known-good git commit/ref")
+    p_bs.add_argument("--bad", required=True,
+                      help="known-bad git commit/ref")
+    p_bs.add_argument("--metric", default="sass_non_nop",
+                      help="metric to track (default: sass_non_nop)")
+    p_bs.add_argument("--first-flip", action="store_true",
+                      help="stop at first flip and print commit summary")
+
+    # ---- profile: GPU runtime + static metrics for a kernel ----
+    p_pr = sub.add_parser(
+        "profile",
+        help="measure actual GPU runtime alongside static metrics",
+        description="Runs the kernel through workbench measure_kernel in "
+                    "bench mode, reporting mean/min/max runtime + speedup "
+                    "vs ptxas.")
+    p_pr.add_argument("--kernel", required=True,
+                      help=f"one of: {', '.join(sorted(KERNELS))}")
+    p_pr.add_argument("--repeat", type=int, default=20,
+                      help="number of measurement repeats (default: 20)")
+
+    # ---- forwarding-candidates: per-kernel verified hazard pairs ----
+    p_fc = sub.add_parser(
+        "forwarding-candidates",
+        help="auto-verify hazard-scan pairs by per-kernel ptxas evidence",
+        description="Tighter version of hazard-scan: only reports pairs "
+                    "where ptxas hits gap=0 in EVERY kernel where the pair "
+                    "appears.  Promote those into _SCHED_FORWARDING_SAFE.")
+    p_fc.add_argument("--min-evidence", type=int, default=3,
+                      help="minimum kernel count to consider a candidate")
+    p_fc.add_argument("--verbose", action="store_true",
+                      help="show example kernels per candidate")
+
+    # ---- pattern-mine: opcode N-grams ptxas uses but we don't ----
+    p_pm = sub.add_parser(
+        "pattern-mine",
+        help="mine opcode N-grams ptxas emits but we don't (or vice versa)",
+        description="Surfaces optimization opportunities at the opcode-shape "
+                    "level (e.g. ptxas uses LEA where we use IMAD.SHL+IADD3).")
+    p_pm.add_argument("--n", type=int, default=3,
+                      help="N-gram length (default: 3)")
+    p_pm.add_argument("--min-count", type=int, default=3,
+                      help="minimum occurrence count to report")
+    p_pm.add_argument("--kernels", default=None,
+                      help="comma-separated kernel names (default: all)")
+
+    # ---- auto-suggest: heuristic analysis of why a GAP persists ----
+    p_as = sub.add_parser(
+        "auto-suggest",
+        help="suggest which existing pass should close a kernel's GAP",
+        description="Heuristic: looks at the emitted SASS for patterns "
+                    "an existing pass should have folded and reports them.")
+    p_as.add_argument("--kernel", required=True,
+                      help=f"one of: {', '.join(sorted(KERNELS))}")
+    p_as.add_argument("--results-dir", default=str(DEFAULT_RESULTS_DIR))
+
+    # ---- watch: file-watcher mode ----
+    p_w = sub.add_parser(
+        "watch",
+        help="rerun the suite on every save of openptxas/sass or ptx files",
+        description="Polls mtimes and re-runs the suite when anything changes.")
+    p_w.add_argument("--interval", type=float, default=2.0,
+                     help="polling interval in seconds (default: 2.0)")
+    p_w.add_argument("--suite", default="all",
+                     help="which suite to run on each change (default: all)")
+
+    # ---- provenance: trace bytes back to passes that touched them ----
+    p_pv = sub.add_parser(
+        "provenance",
+        help="trace 16-byte SASS instr back to pipeline passes",
+        description="Given a 16-byte hex instruction in a kernel's emitted "
+                    "SASS, find its position and list every pass marker "
+                    "found in its comment.")
+    p_pv.add_argument("--kernel", required=True,
+                      help=f"one of: {', '.join(sorted(KERNELS))}")
+    p_pv.add_argument("--bytes", required=True,
+                      help="32 hex chars (16 bytes)")
+
+    # ---- forge-trace: cross-stack trace from .fg → PTX → SASS ----
+    p_ft = sub.add_parser(
+        "forge-trace",
+        help="cross-stack trace from .fg source through PTX to SASS",
+        description="Pulls .fg source + cached PTX from the forge catalog "
+                    "and shows side-by-side with our SASS output.")
+    p_ft.add_argument("--target", required=True,
+                      help="forge target name (run `workbench forge list` "
+                           "to see catalog)")
+
+    # ---- encode-fuzz: exhaustive encoder probe ----
+    p_ef = sub.add_parser(
+        "encode-fuzz",
+        help="exhaustively encode an opcode under constraints",
+        description="Initial implementation: IMAD over an --imm-range, "
+                    "flagging acc-alias and pow-of-2 cases.")
+    p_ef.add_argument("--opcode", required=True, help="opcode label (only IMAD initially)")
+    p_ef.add_argument("--dest", type=int, default=4)
+    p_ef.add_argument("--src0", type=int, default=3)
+    p_ef.add_argument("--src2", type=int, default=4)
+    p_ef.add_argument("--imm-range", default=None,
+                      help='range like "1..16" or comma list "1,3,5,7"')
+
     # ---- stress: single-machine GPU correctness loop ----
     p_stress = sub.add_parser(
         "stress",
@@ -5685,6 +7081,44 @@ def main():
         return _cmd_why_fail(args)
     if args.cmd == "guard":
         return _cmd_guard(args)
+    if args.cmd == "disasm":
+        return _cmd_disasm(args)
+    if args.cmd == "encode":
+        return _cmd_encode(args)
+    if args.cmd == "csv":
+        return _cmd_csv(args)
+    if args.cmd == "heatmap":
+        return _cmd_heatmap(args)
+    if args.cmd == "replay":
+        return _cmd_replay(args)
+    if args.cmd == "flake-check":
+        return _cmd_flake_check(args)
+    if args.cmd == "search":
+        return _cmd_search(args)
+    if args.cmd == "opcode-info":
+        return _cmd_opcode_info(args)
+    if args.cmd == "pass-info":
+        return _cmd_pass_info(args)
+    if args.cmd == "field-info":
+        return _cmd_field_info(args)
+    if args.cmd == "bisect":
+        return _cmd_bisect(args)
+    if args.cmd == "profile":
+        return _cmd_profile(args)
+    if args.cmd == "forwarding-candidates":
+        return _cmd_forwarding_candidates(args)
+    if args.cmd == "pattern-mine":
+        return _cmd_pattern_mine(args)
+    if args.cmd == "auto-suggest":
+        return _cmd_auto_suggest(args)
+    if args.cmd == "watch":
+        return _cmd_watch(args)
+    if args.cmd == "provenance":
+        return _cmd_provenance(args)
+    if args.cmd == "forge-trace":
+        return _cmd_forge_trace(args)
+    if args.cmd == "encode-fuzz":
+        return _cmd_encode_fuzz(args)
     if args.cmd == "leaderboard":
         # FG-2 B3: leaderboard is a thin alias over status, so it
         # replays the same saved suite_all artifact.
