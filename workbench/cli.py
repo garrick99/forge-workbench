@@ -4251,16 +4251,45 @@ def _format_ctrl_decode(b13: int, b14: int, b15: int) -> str:
 
 # Pipeline pass markers we recognize in verbose output and link back to
 # specific instruction positions.  Each entry maps a substring to a short
-# tag we'll show next to instructions.
+# tag we'll show next to instructions.  The list is conservative — every
+# tag corresponds to a real openptxas pass that emits an annotation in
+# SassInstr.comment.
 _PASS_MARKERS = (
+    # Numeric stage names (FG = Forge-gate, FB = Forge-byte)
+    ("FG29", "FG29"),
+    ("FG30", "FG30"),
+    ("FG31", "FG31"),
+    ("FG32", "FG32"),
     ("FG33", "FG33"),
+    ("FG34", "FG34"),
     ("FG36", "FG36"),
     ("FG52", "FG52"),
+    ("FG54", "FG54"),
+    ("FG69", "FG69"),
+    ("FB-4", "FB-4"),
+    # Mixed-pred / multi-pred guards
     ("MP02", "MP02"),
+    # Template families
     ("TPL01", "TPL01"),
     ("TPL05", "TPL05"),
-    ("FB-4", "FB-4"),
+    ("TPL07", "TPL07"),
+    ("TPL11", "TPL11"),
+    ("TPL13", "TPL13"),
+    # TE = template-emit canonical patterns
+    ("TE10", "TE10"),
+    ("TE21", "TE21"),
+    ("TE27", "TE27"),
+    ("TE28", "TE28"),
+    ("TE29", "TE29"),
+    ("TE35", "TE35"),
+    # UI = uniform-imm / uniform-reg adapters
+    ("UI03", "UI03"),
+    # ALLOC = address allocator collapse (cvt+shl+add → IADD3.UR pair)
+    ("ALLOC:", "ALLOC"),
+    # Compaction (post-final regalloc field rewrite)
     ("compact]", "COMPACT"),
+    # PTXAS-Rxx = ptxas-faithful rewrites
+    ("PTXAS-R", "PTXAS-R"),
 )
 
 
