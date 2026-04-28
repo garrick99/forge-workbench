@@ -48,6 +48,7 @@ import json
 import math
 import os
 import platform
+import re
 import struct
 import subprocess
 import sys
@@ -4219,29 +4220,161 @@ def _extract_sass_text(cubin: bytes, symbol: str) -> list[str]:
     return []
 
 
-def _cmd_kdiff(args):
-    """FG-2 B2: one-shot compile of a catalogued kernel through both
-    OpenPTXas and PTXAS, then print a side-by-side SASS diff plus the
-    delta block.
+def _decode_ctrl_word(b13: int, b14: int, b15: int) -> dict:
+    """Decode SM_120 control word from bytes 13/14/15 of an instruction.
+    Storage: raw24 = (b13) | (b14<<8) | (b15<<16); ctrl = raw24 >> 1.
+    Field layout (matches sass.encoding.sm_120_opcodes._ctrl_to_bytes):
+      bits[3:0]   misc       (sequencing counter)
+      bits[9:4]   wdep       (write-dependency scoreboard slot)
+      bits[14:10] rbar       (read barrier wait mask)
+      bit[15]     wbar       (write barrier flag)
+      bit[16]     yield      (yield bit)
+      bits[22:17] stall      (stall cycles, ignored on SM_120)
     """
+    raw24 = b13 | (b14 << 8) | (b15 << 16)
+    ctrl = raw24 >> 1
+    return {
+        "misc":  ctrl & 0xf,
+        "wdep":  (ctrl >> 4) & 0x3f,
+        "rbar":  (ctrl >> 10) & 0x1f,
+        "wbar":  (ctrl >> 15) & 1,
+        "yield": (ctrl >> 16) & 1,
+        "stall": (ctrl >> 17) & 0x3f,
+    }
+
+
+def _format_ctrl_decode(b13: int, b14: int, b15: int) -> str:
+    f = _decode_ctrl_word(b13, b14, b15)
+    return (f"[wdep={f['wdep']:02x} rbar={f['rbar']:02x} "
+            f"stall={f['stall']:d} y={f['yield']:d}]")
+
+
+# Pipeline pass markers we recognize in verbose output and link back to
+# specific instruction positions.  Each entry maps a substring to a short
+# tag we'll show next to instructions.
+_PASS_MARKERS = (
+    ("FG33", "FG33"),
+    ("FG36", "FG36"),
+    ("FG52", "FG52"),
+    ("MP02", "MP02"),
+    ("TPL01", "TPL01"),
+    ("TPL05", "TPL05"),
+    ("FB-4", "FB-4"),
+    ("compact]", "COMPACT"),
+)
+
+
+def _capture_compile_verbose(ptx: str) -> tuple[bytes, str]:
+    """Compile PTX through the openptxas pipeline with verbose=True,
+    capturing the verbose log so callers can extract pass markers.
+    Returns (cubin_bytes, verbose_log_text).  Always uses the first
+    kernel emitted.
+    """
+    import io, contextlib
+    from sass.pipeline import compile_ptx_source as _cps
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        results = _cps(ptx, verbose=True)
+    cubin = next(iter(results.values())) if isinstance(results, dict) else results
+    return cubin, buf.getvalue()
+
+
+def _extract_pass_tags_per_pos(verbose_log: str, n_instrs: int) -> list[str]:
+    """Walk the verbose pipeline log and attach a short pass tag to each
+    instruction position.  Returns a list of ' '-separated tag strings,
+    one per instruction position.
+
+    The pipeline emits final-state lines tagged `[trace-final] +N: <hex>  // <comment>`.
+    Comments carry per-pass markers like `[FG33:ctrl]`, `[FG36:R0/R5]`,
+    `[TPL01]`, etc.  We extract any marker we recognize and attach it
+    to the corresponding instruction position.
+    """
+    tags = [""] * n_instrs
+    insn_re = re.compile(r"\[trace-final\]\s*\+\s+(\d+):\s+([0-9a-f]+)\s+//\s*(.*)$")
+    for line in verbose_log.splitlines():
+        m = insn_re.search(line)
+        if not m:
+            continue
+        offset = int(m.group(1))
+        idx = offset // 16
+        if not (0 <= idx < n_instrs):
+            continue
+        comment = m.group(3)
+        marker_tags = []
+        for substr, tag in _PASS_MARKERS:
+            if substr in comment:
+                marker_tags.append(tag)
+        if marker_tags:
+            tags[idx] = ",".join(marker_tags)
+    return tags
+
+
+def _resolve_kdiff_ptx(args) -> tuple[str | None, str | None, int]:
+    """Resolve PTX source for kdiff.  Supports --kernel (catalogued) or
+    --inline-ptx (file path or '-' for stdin).  Returns (name, ptx, rc)
+    where rc is non-zero on error and ptx/name may be None.
+    """
+    inline = getattr(args, "inline_ptx", None)
+    if inline:
+        if inline == "-":
+            ptx = sys.stdin.read()
+            name = "<stdin>"
+        else:
+            ptx = Path(inline).read_text(encoding="utf-8")
+            name = Path(inline).stem
+        return name, ptx, 0
     name = args.kernel
+    if not name:
+        print("workbench kdiff: --kernel or --inline-ptx required", file=sys.stderr)
+        return None, None, 2
     if name not in KERNELS:
         print(f"workbench kdiff: unknown kernel '{name}'. "
-              f"Try `workbench list`.",
-              file=sys.stderr)
-        return 2
+              f"Try `workbench list`.", file=sys.stderr)
+        return None, None, 2
     entry = KERNELS[name]
-    symbol = entry["kernel_name"]
     ptx = entry.get("ptx_inline")
     if ptx is None:
         path = entry.get("ptx_path")
         if path is None:
             print(f"workbench kdiff: no PTX source for '{name}'", file=sys.stderr)
-            return 2
+            return None, None, 2
         ptx = Path(path).read_text(encoding="utf-8")
+    return name, ptx, 0
+
+
+def _kernel_symbol(name: str | None, ptx: str) -> str:
+    """Resolve symbol name from KERNELS entry, or parse from inline PTX."""
+    if name and name in KERNELS:
+        return KERNELS[name]["kernel_name"]
+    m = re.search(r"\.visible\s+\.entry\s+([A-Za-z_][A-Za-z0-9_]*)", ptx)
+    return m.group(1) if m else (name or "<unknown>")
+
+
+def _cmd_kdiff(args):
+    """One-shot compile of a kernel through OpenPTXas and PTXAS, with
+    side-by-side SASS diff.
+
+    Enhancements (2026-04-28):
+      --annotate     attach pipeline pass tags (FG33/FG36/...) to each line
+      --decode-ctrl  decode wdep/rbar/stall and append to each line
+      --field FIELD  highlight diffs only when FIELD differs (wdep/rbar/dest/...)
+      --inline-ptx P read PTX from file path P (or '-' for stdin)
+    """
+    name, ptx, rc = _resolve_kdiff_ptx(args)
+    if rc != 0:
+        return rc
+    symbol = _kernel_symbol(name, ptx)
+
+    annotate = getattr(args, "annotate", False)
+    decode_ctrl = getattr(args, "decode_ctrl", False)
+    field = getattr(args, "field", None)
 
     try:
-        cubin_o, _ = compile_openptxas(ptx)
+        if annotate:
+            cubin_o, verbose_log = _capture_compile_verbose(ptx)
+        else:
+            cubin_o, _ = compile_openptxas(ptx)
+            verbose_log = ""
     except Exception as exc:
         print(f"workbench kdiff: openptxas failed: {exc}", file=sys.stderr)
         return 1
@@ -4275,23 +4408,778 @@ def _cmd_kdiff(args):
     sass_o = _extract_sass_text(cubin_o, symbol)
     sass_p = _extract_sass_text(cubin_p, symbol)
 
-    print("side-by-side SASS  (! marks lines that differ):")
+    pass_tags = (_extract_pass_tags_per_pos(verbose_log, len(sass_o))
+                 if annotate else [""] * len(sass_o))
+
+    if field is not None:
+        print(f"side-by-side SASS  (! marks lines whose `{field}` field differs):")
+    else:
+        print("side-by-side SASS  (! marks lines that differ):")
     print("=" * 92)
     width = 42
     max_len = max(len(sass_o), len(sass_p))
     for i in range(max_len):
         lo = sass_o[i] if i < len(sass_o) else ""
         lp = sass_p[i] if i < len(sass_p) else ""
-        # Compare by opcode label (last token after hex)
-        lo_op = lo.split("  ")[-1] if lo else ""
-        lp_op = lp.split("  ")[-1] if lp else ""
-        marker = "!" if lo_op != lp_op else " "
-        # Show hex + opcode label, truncate to width
+
+        def _bytes_of(line: str) -> bytes | None:
+            if not line:
+                return None
+            tok = line.split()
+            if not tok:
+                return None
+            try:
+                return bytes.fromhex(tok[0])
+            except ValueError:
+                return None
+
+        bo = _bytes_of(lo)
+        bp = _bytes_of(lp)
+
+        if field is not None:
+            marker = " "
+            if bo and bp and len(bo) >= 16 and len(bp) >= 16:
+                fo = _decode_ctrl_word(bo[13], bo[14], bo[15])
+                fp = _decode_ctrl_word(bp[13], bp[14], bp[15])
+                if field in ("wdep", "rbar", "stall", "wbar", "yield", "misc"):
+                    if fo.get(field) != fp.get(field):
+                        marker = "!"
+                elif field == "dest":
+                    if bo[2] != bp[2]:
+                        marker = "!"
+                elif field == "src0":
+                    if bo[3] != bp[3]:
+                        marker = "!"
+                elif field == "src1":
+                    if bo[4] != bp[4]:
+                        marker = "!"
+                elif field == "src2":
+                    if bo[8] != bp[8]:
+                        marker = "!"
+                elif field == "opcode":
+                    if (bo[0], bo[1] & 0x0f) != (bp[0], bp[1] & 0x0f):
+                        marker = "!"
+                elif field == "bytes":
+                    if bo != bp:
+                        marker = "!"
+                else:
+                    print(f"workbench kdiff: unknown --field '{field}'",
+                          file=sys.stderr)
+                    return 2
+        else:
+            lo_op = lo.split("  ")[-1] if lo else ""
+            lp_op = lp.split("  ")[-1] if lp else ""
+            marker = "!" if lo_op != lp_op else " "
+
         def _cell(s):
-            # Take everything after first double-space once
             if not s: return ""
             return s[:width]
-        print(f"{marker} {_cell(lo):<{width}s} | {_cell(lp):<{width}s}")
+
+        suffix = ""
+        if decode_ctrl:
+            o_dec = (_format_ctrl_decode(bo[13], bo[14], bo[15])
+                     if bo and len(bo) >= 16 else "")
+            p_dec = (_format_ctrl_decode(bp[13], bp[14], bp[15])
+                     if bp and len(bp) >= 16 else "")
+            if o_dec or p_dec:
+                suffix += f" O:{o_dec} P:{p_dec}"
+        if annotate and i < len(pass_tags) and pass_tags[i]:
+            suffix += " {" + pass_tags[i] + "}"
+
+        line_out = f"{marker} {_cell(lo):<{width}s} | {_cell(lp):<{width}s}"
+        if suffix:
+            line_out += suffix
+        print(line_out)
+    return 0
+
+
+def _decode_opcode(raw: bytes) -> int:
+    """Standard SM_120 opcode extraction: low 12 bits of (b0 | b1<<8)."""
+    if len(raw) < 2:
+        return 0
+    return (raw[0] | (raw[1] << 8)) & 0xFFF
+
+
+def _opcode_label(opcode: int) -> str:
+    """Best-effort opcode label for audit output."""
+    _LABELS = {
+        0x210: "IADD3", 0x810: "IADD3.IM", 0x212: "LOP3.RR", 0x812: "LOP3.IMM",
+        0x824: "IMAD", 0x224: "IMAD.32", 0x2a4: "IMAD.RR", 0xc24: "IMAD.RU",
+        0x825: "IMAD.WIDE", 0x225: "IMAD.WIDE.RR",
+        0xc11: "IADD3.UR", 0xc35: "IADD.64-UR", 0x235: "IADD.64",
+        0x986: "STG.E", 0x981: "LDG.E", 0x7ac: "LDCU",
+        0x919: "S2R", 0x9c3: "S2UR",
+        0x20c: "ISETP", 0xc0c: "ISETP.UR", 0x80c: "ISETP.IM",
+        0x94d: "EXIT", 0x947: "BRA", 0x918: "NOP",
+        0xb82: "LDC", 0xc02: "MOV.UR", 0x82a: "SEL",
+    }
+    return _LABELS.get(opcode, f"OP_{opcode:03x}")
+
+
+def _disasm_kernel_pair(name: str) -> tuple[list[bytes], list[bytes]] | None:
+    """Compile a catalogued kernel through both openptxas and ptxas and
+    return per-instruction byte slices.  Returns None on failure.
+    """
+    if name not in KERNELS:
+        return None
+    entry = KERNELS[name]
+    ptx = entry.get("ptx_inline")
+    if ptx is None:
+        path = entry.get("ptx_path")
+        if path is None:
+            return None
+        ptx = Path(path).read_text(encoding="utf-8")
+    symbol = entry["kernel_name"]
+    try:
+        cubin_o, _ = compile_openptxas(ptx)
+        cubin_p, _ = compile_ptxas(ptx)
+    except Exception:
+        return None
+
+    def _slice(cubin: bytes, symbol: str) -> list[bytes]:
+        # Re-use _extract_sass_text's logic but return raw bytes.
+        # Each line produced by _extract_sass_text starts with the hex.
+        text_lines = _extract_sass_text(cubin, symbol)
+        out: list[bytes] = []
+        for line in text_lines:
+            tok = line.split()
+            if not tok:
+                continue
+            try:
+                b = bytes.fromhex(tok[0])
+            except ValueError:
+                continue
+            if len(b) >= 16:
+                out.append(b[:16])
+        return out
+
+    return _slice(cubin_o, symbol), _slice(cubin_p, symbol)
+
+
+def _cmd_wdep_audit(args):
+    """Scan every catalogued kernel and report instructions whose
+    wdep / rbar control fields differ between ours and ptxas at
+    matching opcode positions.  Group by (opcode, our_wdep, ptxas_wdep)
+    so systemic discrepancies (e.g. always missing slot rotation on
+    LDCU) become visible.
+    """
+    target_kernels = (args.kernels.split(",") if args.kernels
+                      else sorted(KERNELS))
+    target_kernels = [k for k in target_kernels if k in KERNELS]
+
+    diffs: dict[tuple[int, int, int], list[tuple[str, int]]] = {}
+    examined = 0
+    skipped = 0
+    for name in target_kernels:
+        pair = _disasm_kernel_pair(name)
+        if pair is None:
+            skipped += 1
+            continue
+        ours, ptxas = pair
+        examined += 1
+        # Walk by index up to min length; opcode mismatches are ignored
+        # here (those are bigger structural diffs that wdep-audit isn't
+        # meant to catch).
+        for i, (bo, bp) in enumerate(zip(ours, ptxas)):
+            opo = _decode_opcode(bo)
+            opp = _decode_opcode(bp)
+            if opo != opp:
+                continue
+            fo = _decode_ctrl_word(bo[13], bo[14], bo[15])
+            fp = _decode_ctrl_word(bp[13], bp[14], bp[15])
+            if fo["wdep"] != fp["wdep"] or fo["rbar"] != fp["rbar"]:
+                key = (opo, fo["wdep"] | (fo["rbar"] << 8),
+                       fp["wdep"] | (fp["rbar"] << 8))
+                diffs.setdefault(key, []).append((name, i))
+
+    print(f"wdep-audit: examined {examined} kernel(s), "
+          f"skipped {skipped} (compile/parse failure).")
+    print()
+    if not diffs:
+        print("  no wdep/rbar discrepancies found.")
+        return 0
+    print("Each row groups (opcode, ours, ptxas).  count = number of "
+          "(kernel, position) tuples where the discrepancy appears.")
+    print()
+    print(f"  {'opcode':<14s}  {'ours':<14s}  {'ptxas':<14s}  {'count':>5s}")
+    print("  " + "-" * 60)
+    rows = []
+    for (opc, o_pack, p_pack), occurrences in diffs.items():
+        o_wdep, o_rbar = o_pack & 0xff, (o_pack >> 8) & 0xff
+        p_wdep, p_rbar = p_pack & 0xff, (p_pack >> 8) & 0xff
+        rows.append((len(occurrences), opc, o_wdep, o_rbar, p_wdep, p_rbar,
+                     occurrences))
+    rows.sort(reverse=True)
+    for count, opc, ow, orbar, pw, prbar, occs in rows:
+        label = _opcode_label(opc)
+        ours_s = f"wdep=0x{ow:02x} rbar={orbar:02x}"
+        ptx_s = f"wdep=0x{pw:02x} rbar={prbar:02x}"
+        print(f"  {label:<14s}  {ours_s:<14s}  {ptx_s:<14s}  {count:>5d}")
+        if args.verbose:
+            sample_kernels = sorted({k for k, _ in occs})[:5]
+            print(f"    e.g. {', '.join(sample_kernels)}")
+    return 0
+
+
+def _cmd_hazard_scan(args):
+    """Scan adjacent (producer, consumer) instruction pairs across all
+    kernels and flag pairs where ptxas inserts a NOP between them but
+    we don't, or vice versa.  Surfaces missing (or spurious) GPR
+    latency rules in our scheduler.
+    """
+    target_kernels = (args.kernels.split(",") if args.kernels
+                      else sorted(KERNELS))
+    target_kernels = [k for k in target_kernels if k in KERNELS]
+
+    NOP = 0x918
+
+    # Map each (producer_op, consumer_op) pair to {ours: count_with_nop,
+    # ptxas: count_with_nop, ours_no_nop: count, ptxas_no_nop: count}
+    stats: dict[tuple[int, int], dict[str, int]] = {}
+    examined = skipped = 0
+
+    def _sequence_pairs(insns: list[bytes]) -> list[tuple[int, int, bool]]:
+        """Yield (prev_op, next_op, separated_by_nop)."""
+        out = []
+        i = 0
+        while i + 1 < len(insns):
+            opi = _decode_opcode(insns[i])
+            if opi == NOP:
+                i += 1
+                continue
+            j = i + 1
+            had_nop = False
+            while j < len(insns) and _decode_opcode(insns[j]) == NOP:
+                had_nop = True
+                j += 1
+            if j >= len(insns):
+                break
+            opj = _decode_opcode(insns[j])
+            out.append((opi, opj, had_nop))
+            i = j
+        return out
+
+    for name in target_kernels:
+        pair = _disasm_kernel_pair(name)
+        if pair is None:
+            skipped += 1
+            continue
+        ours, ptxas = pair
+        examined += 1
+        for opi, opj, had_nop in _sequence_pairs(ours):
+            key = (opi, opj)
+            d = stats.setdefault(key, {"ours_nop": 0, "ours_nonop": 0,
+                                        "ptxas_nop": 0, "ptxas_nonop": 0})
+            d["ours_nop" if had_nop else "ours_nonop"] += 1
+        for opi, opj, had_nop in _sequence_pairs(ptxas):
+            key = (opi, opj)
+            d = stats.setdefault(key, {"ours_nop": 0, "ours_nonop": 0,
+                                        "ptxas_nop": 0, "ptxas_nonop": 0})
+            d["ptxas_nop" if had_nop else "ptxas_nonop"] += 1
+
+    print(f"hazard-scan: examined {examined} kernel(s), "
+          f"skipped {skipped} (compile/parse failure).")
+    print()
+
+    # Surface pairs where we DON'T insert NOPs but ptxas DOES (potential
+    # missing hazard rule), and pairs where we always-NOP but ptxas never
+    # does (over-conservative scheduling).
+    underNOP = []
+    overNOP = []
+    for (opi, opj), d in stats.items():
+        ours_total = d["ours_nop"] + d["ours_nonop"]
+        ptx_total  = d["ptxas_nop"] + d["ptxas_nonop"]
+        if ours_total == 0 or ptx_total == 0:
+            continue
+        ours_nop_pct  = d["ours_nop"] / ours_total
+        ptxas_nop_pct = d["ptxas_nop"] / ptx_total
+        # Skip pairs both sides agree on.
+        if abs(ours_nop_pct - ptxas_nop_pct) < 0.20:
+            continue
+        row = (opi, opj, d["ours_nop"], d["ours_nonop"],
+               d["ptxas_nop"], d["ptxas_nonop"])
+        if ours_nop_pct < ptxas_nop_pct:
+            underNOP.append(row)
+        else:
+            overNOP.append(row)
+
+    def _print_section(title, rows):
+        if not rows:
+            print(f"  {title}: (none)")
+            return
+        print(f"  {title}:")
+        print(f"    {'producer':<12s} {'consumer':<12s} "
+              f"{'ours nop / no-nop':>20s}  {'ptxas nop / no-nop':>20s}")
+        rows.sort(key=lambda r: -(r[4] + r[5]))
+        for opi, opj, oN, on, pN, pn in rows[:15]:
+            print(f"    {_opcode_label(opi):<12s} {_opcode_label(opj):<12s} "
+                  f"{oN:>10d} / {on:<8d}  {pN:>10d} / {pn:<8d}")
+
+    _print_section("ours UNDER-NOPs (ptxas inserts more — possible missing hazard rule)",
+                   underNOP)
+    print()
+    _print_section("ours OVER-NOPs (we add NOPs ptxas doesn't — over-conservative)",
+                   overNOP)
+    return 0
+
+
+_PTX_PASS_NAMES = (
+    "unroll", "load_cse", "add3_chain_reduce", "mul3_chain_reduce",
+    "cvt_roundtrip_fold", "add_forward_chain", "bitop_imm_chain_fold",
+    "mul_imm_chain_fold", "common_mul_sum", "cvt_shl_cse",
+    "trivial_fold", "imm_add_fold", "imm_xor_fold",
+    "repeated_add_reduce", "dead_self_update_dce",
+)
+
+
+def _cmd_gap_trends(args):
+    """Per-kernel sass_non_nop sparkline across all suite_all artifacts.
+    Reads results/*_suite_all.json in chronological order and prints a
+    one-line sparkline per kernel showing how its delta evolved.
+    """
+    import glob
+    import math as _math
+    pattern = os.path.join(args.results_dir, "*_suite_all*.json")
+    files = sorted(glob.glob(pattern))
+    if args.limit:
+        files = files[-args.limit:]
+    if not files:
+        print(f"workbench gap-trends: no suite_all artifacts in {args.results_dir}",
+              file=sys.stderr)
+        return 2
+
+    # Load all artifacts in order
+    artifact_data = []
+    for fpath in files:
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                artifact_data.append((fpath, json.load(f)))
+        except Exception:
+            continue
+
+    # Per-kernel deltas across artifacts
+    per_kernel: dict[str, list[int | None]] = {}
+    timestamps: list[str] = []
+    for fpath, art in artifact_data:
+        timestamps.append(art.get("timestamp", os.path.basename(fpath)))
+        for k in art.get("kernels", []):
+            kn = k.get("kernel")
+            if not kn:
+                continue
+            deltas = k.get("deltas") or {}
+            d = deltas.get("sass_non_nop")
+            per_kernel.setdefault(kn, []).append(d)
+
+    # Pad missing entries
+    n = len(artifact_data)
+    for kn, vals in per_kernel.items():
+        if len(vals) < n:
+            per_kernel[kn] = [None] * (n - len(vals)) + vals
+
+    # Sparkline character set
+    blocks = " ▁▂▃▄▅▆▇█"
+
+    def _spark(vals: list[int | None]) -> str:
+        nums = [v for v in vals if v is not None]
+        if not nums:
+            return "-" * len(vals)
+        lo, hi = min(nums), max(nums)
+        rng = max(hi - lo, 1)
+        out = []
+        for v in vals:
+            if v is None:
+                out.append("·")
+            else:
+                idx = int((v - lo) / rng * (len(blocks) - 1))
+                out.append(blocks[idx])
+        return "".join(out)
+
+    if args.kernel:
+        target = [args.kernel]
+    else:
+        target = sorted(per_kernel.keys())
+
+    print(f"gap-trends: {n} artifact(s), {len(per_kernel)} kernel(s)")
+    print(f"  oldest:  {timestamps[0]}")
+    print(f"  newest:  {timestamps[-1]}")
+    print()
+
+    rows = []
+    for kn in target:
+        vals = per_kernel.get(kn, [])
+        if not vals:
+            continue
+        first = next((v for v in vals if v is not None), None)
+        last = next((v for v in reversed(vals) if v is not None), None)
+        change = (last - first) if (first is not None and last is not None) else None
+        rows.append((change if change is not None else 0, kn, vals, first, last, change))
+
+    # Sort: most-improved first, then most-regressed
+    if args.sort == "improvement":
+        rows.sort(key=lambda r: (r[0] is None, r[0]))
+    elif args.sort == "regression":
+        rows.sort(key=lambda r: -(r[0] or 0))
+    else:
+        rows.sort(key=lambda r: r[1])
+
+    print(f"  {'kernel':<32s}  {'first':>5s} {'last':>5s} {'Δ':>6s}  trend")
+    print("  " + "-" * 80)
+    for change, kn, vals, first, last, delta in rows:
+        spark = _spark(vals)
+        f_s = f"{first:+d}" if first is not None else "  -"
+        l_s = f"{last:+d}" if last is not None else "  -"
+        d_s = f"{delta:+d}" if delta is not None else "  -"
+        print(f"  {kn:<32s}  {f_s:>5s} {l_s:>5s} {d_s:>6s}  {spark}")
+    return 0
+
+
+def _cmd_export(args):
+    """Compile a kernel and dump one of its forms (ptx / cubin / sass /
+    sass-decoded) to stdout or a file.  Saves the round-tripping I had
+    to do manually during debugging.
+    """
+    name, ptx, rc = _resolve_kdiff_ptx(args)
+    if rc != 0:
+        return rc
+    symbol = _kernel_symbol(name, ptx)
+    fmt = args.format
+
+    if fmt == "ptx":
+        out_text = ptx
+        out_bytes = None
+    else:
+        try:
+            backend = (args.backend or "openptxas")
+            if backend == "openptxas":
+                cubin, _ = compile_openptxas(ptx)
+            elif backend == "ptxas":
+                cubin, _ = compile_ptxas(ptx)
+            else:
+                print(f"workbench export: unknown --backend '{backend}'",
+                      file=sys.stderr)
+                return 2
+        except Exception as exc:
+            print(f"workbench export: compile failed: {exc}", file=sys.stderr)
+            return 1
+        if fmt == "cubin":
+            out_text = None
+            out_bytes = cubin
+        elif fmt == "sass":
+            out_text = "\n".join(_extract_sass_text(cubin, symbol))
+            out_bytes = None
+        elif fmt == "sass-decoded":
+            lines = _extract_sass_text(cubin, symbol)
+            out_lines = []
+            for line in lines:
+                tok = line.split()
+                if not tok:
+                    out_lines.append(line)
+                    continue
+                try:
+                    b = bytes.fromhex(tok[0])
+                except ValueError:
+                    out_lines.append(line)
+                    continue
+                if len(b) >= 16:
+                    suffix = " " + _format_ctrl_decode(b[13], b[14], b[15])
+                    out_lines.append(line + suffix)
+                else:
+                    out_lines.append(line)
+            out_text = "\n".join(out_lines)
+            out_bytes = None
+        else:
+            print(f"workbench export: unknown --format '{fmt}'", file=sys.stderr)
+            return 2
+
+    if args.out:
+        if out_bytes is not None:
+            Path(args.out).write_bytes(out_bytes)
+        else:
+            Path(args.out).write_text(out_text or "", encoding="utf-8")
+        print(f"workbench export: wrote {args.out}", file=sys.stderr)
+    else:
+        if out_bytes is not None:
+            sys.stdout.buffer.write(out_bytes)
+        else:
+            print(out_text or "")
+    return 0
+
+
+def _cmd_sweep(args):
+    """Toggle one or more PTX-IR passes off, run the suite, and produce
+    a delta artifact comparing against the most recent suite_all.
+
+    Uses OPENPTXAS_DISABLE_PASSES to communicate with the pipeline
+    without hand-editing sass/pipeline.py.
+    """
+    pass_list = [p.strip() for p in args.passes.split(",") if p.strip()]
+    unknown = [p for p in pass_list if p not in _PTX_PASS_NAMES]
+    if unknown:
+        print(f"workbench sweep: unknown pass(es): {', '.join(unknown)}",
+              file=sys.stderr)
+        print(f"  available: {', '.join(_PTX_PASS_NAMES)}", file=sys.stderr)
+        return 2
+
+    # Save current env, set the disable list, fork a workbench `run` invocation.
+    prior = os.environ.get("OPENPTXAS_DISABLE_PASSES")
+    os.environ["OPENPTXAS_DISABLE_PASSES"] = ",".join(pass_list)
+    try:
+        # Find baseline artifact BEFORE running the sweep so we can diff.
+        import glob
+        pattern = os.path.join(args.results_dir, "*_suite_all*.json")
+        baseline_files = sorted(glob.glob(pattern))
+        baseline_path = baseline_files[-1] if baseline_files else None
+
+        print(f"sweep: disabling passes {pass_list}")
+        print(f"sweep: baseline = {baseline_path}")
+        # Re-invoke the run command via subprocess so artifact resolution
+        # uses the standard path (writes a new suite_all.json file).
+        cmd = [sys.executable, "-m", "workbench", "run",
+               "--suite", args.suite or "all", "--mode", "correct",
+               "--compare", "ptxas",
+               "--results-dir", args.results_dir]
+        result = subprocess.run(cmd, env=os.environ.copy())
+        if result.returncode != 0:
+            print(f"sweep: suite run failed (rc={result.returncode})", file=sys.stderr)
+            return result.returncode
+    finally:
+        if prior is None:
+            os.environ.pop("OPENPTXAS_DISABLE_PASSES", None)
+        else:
+            os.environ["OPENPTXAS_DISABLE_PASSES"] = prior
+
+    # Find new artifact
+    new_files = sorted(glob.glob(pattern))
+    if not new_files or new_files[-1] == baseline_path:
+        print("sweep: no new artifact produced", file=sys.stderr)
+        return 1
+    new_path = new_files[-1]
+    print(f"sweep: new artifact = {new_path}")
+    print()
+
+    # Compute and display the per-kernel diff
+    if not baseline_path:
+        print("sweep: no baseline to compare against")
+        return 0
+    with open(baseline_path) as f: base = json.load(f)
+    with open(new_path) as f: new = json.load(f)
+    base_by = {k["kernel"]: k for k in base.get("kernels", [])}
+    new_by = {k["kernel"]: k for k in new.get("kernels", [])}
+    fails = [k["kernel"] for k in new.get("kernels", [])
+             if k.get("correctness") == "FAIL"]
+    print(f"FAILS introduced: {fails}")
+    changes = []
+    for kn, n in new_by.items():
+        b = base_by.get(kn)
+        if not b: continue
+        nd = n.get("deltas", {}).get("sass_non_nop", 0)
+        bd = b.get("deltas", {}).get("sass_non_nop", 0)
+        if nd != bd:
+            changes.append((nd - bd, kn, bd, nd))
+    changes.sort()
+    print()
+    print(f"per-kernel sass_non_nop changes (vs baseline):")
+    for diff, kn, b, n in changes:
+        print(f"  {diff:+d}  {kn:<30s}  {b:+d} -> {n:+d}")
+    if not changes:
+        print("  (no change)")
+    return 0
+
+
+def _cmd_why_fail(args):
+    """Bisect across PTX passes to find which one introduces a
+    correctness FAIL or build error for a given kernel.
+
+    Strategy: start with all passes enabled, confirm FAIL.  Then
+    disable passes one at a time (right to left) until correctness
+    flips back to PASS.  The pass that, when disabled, restores
+    correctness is the culprit.
+    """
+    name = args.kernel
+    if name not in KERNELS:
+        print(f"workbench why-fail: unknown kernel '{name}'", file=sys.stderr)
+        return 2
+
+    def _run_with(disabled_passes: list[str]) -> bool:
+        """Compile and check correctness with the given passes disabled."""
+        env = os.environ.copy()
+        env["OPENPTXAS_DISABLE_PASSES"] = ",".join(disabled_passes)
+        cmd = [sys.executable, "-m", "workbench", "run",
+               "--kernel", name, "--mode", "correct", "--compare", "ptxas"]
+        result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        return "correct:  PASS" in result.stdout
+
+    # Confirm baseline behavior
+    print(f"why-fail: bisecting failure for kernel '{name}'")
+    base_pass = _run_with([])
+    print(f"  with all passes:        {'PASS' if base_pass else 'FAIL'}")
+    if base_pass:
+        print("  kernel currently passes -- nothing to bisect.")
+        return 0
+    all_disabled_pass = _run_with(list(_PTX_PASS_NAMES))
+    print(f"  with all passes off:    {'PASS' if all_disabled_pass else 'FAIL'}")
+    if not all_disabled_pass:
+        print("  kernel still fails with all PTX passes off; bug is in")
+        print("  isel/regalloc/scoreboard/scheduler, not the PTX-IR layer.")
+        return 0
+
+    # Bisect: find smallest disabled set that flips PASS.
+    print()
+    print("  searching for minimal disable set...")
+    disabled: list[str] = []
+    for pname in reversed(_PTX_PASS_NAMES):
+        candidate = disabled + [pname]
+        passes = _run_with(candidate)
+        marker = "PASS ✓" if passes else "FAIL"
+        print(f"    disable {','.join(candidate):<60s}  {marker}")
+        if passes:
+            print()
+            print(f"  culprit candidate: disabling {pname} restores correctness.")
+            print(f"  (run `workbench sweep --passes {pname}` to confirm "
+                  "across the full suite)")
+            return 0
+        disabled.append(pname)
+
+    print("  exhausted; no single disabled-set restored correctness.")
+    return 1
+
+
+def _cmd_guard(args):
+    """CI baseline guard.  Compare the latest suite_all artifact against
+    a pinned baseline file and exit non-zero on regression.
+    """
+    if not args.baseline:
+        print("workbench guard: --baseline required", file=sys.stderr)
+        return 2
+    if not Path(args.baseline).exists():
+        print(f"workbench guard: baseline not found: {args.baseline}",
+              file=sys.stderr)
+        return 2
+
+    import glob
+    pattern = os.path.join(args.results_dir, "*_suite_all*.json")
+    files = sorted(glob.glob(pattern))
+    if not files:
+        print(f"workbench guard: no suite_all artifacts in {args.results_dir}",
+              file=sys.stderr)
+        return 2
+    latest = files[-1]
+
+    with open(args.baseline) as f: base = json.load(f)
+    with open(latest) as f: cur = json.load(f)
+    base_by = {k["kernel"]: k for k in base.get("kernels", [])}
+    cur_by = {k["kernel"]: k for k in cur.get("kernels", [])}
+
+    new_fails = [k for k, v in cur_by.items()
+                 if v.get("correctness") == "FAIL"
+                 and base_by.get(k, {}).get("correctness") != "FAIL"]
+    new_build_fails = [k for k, v in cur_by.items()
+                       if v.get("build") == "FAIL"
+                       and base_by.get(k, {}).get("build") != "FAIL"]
+    regressions = []
+    for kn, c in cur_by.items():
+        b = base_by.get(kn)
+        if not b: continue
+        nd = c.get("deltas", {}).get("sass_non_nop", 0)
+        bd = b.get("deltas", {}).get("sass_non_nop", 0)
+        if nd > bd + (args.tolerance or 0):
+            regressions.append((nd - bd, kn, bd, nd))
+
+    print(f"guard: baseline = {args.baseline}")
+    print(f"guard: latest   = {latest}")
+    print()
+    if new_fails:
+        print(f"  NEW correctness FAILs: {new_fails}")
+    if new_build_fails:
+        print(f"  NEW build FAILs:       {new_build_fails}")
+    if regressions:
+        print(f"  GAP regressions ({len(regressions)} kernel(s), "
+              f"tolerance={args.tolerance or 0}):")
+        regressions.sort(reverse=True)
+        for diff, kn, bd, nd in regressions[:20]:
+            print(f"    +{diff:<3d}  {kn:<30s}  {bd:+d} -> {nd:+d}")
+
+    has_problem = bool(new_fails or new_build_fails or regressions)
+    if has_problem:
+        print()
+        print("guard: REGRESSION DETECTED — exiting non-zero.")
+        return 1
+    print("guard: OK — no regressions vs baseline.")
+    return 0
+
+
+def _cmd_trace(args):
+    """Compile a kernel with verbose pipeline output and emit a structured
+    log of every pass that fired, what it patched, and the final
+    SASS with per-instruction pass tags.
+
+    Useful when a kernel goes from PASS to FAIL and you need to find
+    which pass touched which instruction.  No `--field` filtering — use
+    `kdiff --annotate` for the side-by-side view.
+    """
+    name, ptx, rc = _resolve_kdiff_ptx(args)
+    if rc != 0:
+        return rc
+    symbol = _kernel_symbol(name, ptx)
+
+    try:
+        cubin, log = _capture_compile_verbose(ptx)
+    except Exception as exc:
+        print(f"workbench trace: compile failed: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"kernel: {name}")
+    print(f"symbol: {symbol}")
+    print()
+
+    # 1. Pass-level summary: every "[FG__]"/"[TPL__]"/"[MP__]"/"[FB-_]"
+    #    one-line message tells us a pass fired.  Show them in order.
+    print("=== pass-level summary ===")
+    summary_re = re.compile(r"^\s*\[([A-Z][A-Z0-9-]+)\]\s+(.*)$")
+    saw_any = False
+    for line in log.splitlines():
+        m = summary_re.match(line)
+        if m:
+            saw_any = True
+            print(f"  [{m.group(1):<8s}] {m.group(2)}")
+    if not saw_any:
+        print("  (no pass-level messages)")
+    print()
+
+    # 2. Per-instruction tag map: walk [trace-final] lines and group
+    #    instructions by which passes touched them.
+    print("=== per-instruction final state ===")
+    insn_re = re.compile(r"\[trace-final\]\s*\+\s+(\d+):\s+([0-9a-f]+)\s+//\s*(.*)$")
+    final_lines: list[tuple[int, str, str]] = []
+    for line in log.splitlines():
+        m = insn_re.search(line)
+        if m:
+            final_lines.append((int(m.group(1)), m.group(2), m.group(3)))
+    if not final_lines:
+        print("  (no [trace-final] lines emitted; check sass/pipeline.py)")
+    for off, hex_, comment in final_lines:
+        tags = []
+        for substr, tag in _PASS_MARKERS:
+            if substr in comment:
+                tags.append(tag)
+        tag_str = (" {" + ",".join(tags) + "}") if tags else ""
+        # Trim comment but keep the meaningful trailing markers
+        short_comment = comment[:64]
+        print(f"  +{off:>4d}: {hex_}  // {short_comment}{tag_str}")
+    print()
+
+    # 3. Pass-incidence matrix: how many instructions did each pass touch?
+    print("=== pass incidence ===")
+    incidence: dict[str, int] = {}
+    for off, hex_, comment in final_lines:
+        for substr, tag in _PASS_MARKERS:
+            if substr in comment:
+                incidence[tag] = incidence.get(tag, 0) + 1
+    if not incidence:
+        print("  (no per-instruction pass markers)")
+    for tag, count in sorted(incidence.items(), key=lambda x: (-x[1], x[0])):
+        print(f"  {tag:<12s} touched {count:>3d} instr(s)")
+
     return 0
 
 
@@ -4503,8 +5391,151 @@ def main():
                     "and print a side-by-side SASS diff. Marks lines that "
                     "differ with a leading `!`.",
     )
-    p_kdiff.add_argument("--kernel", required=True,
+    p_kdiff.add_argument("--kernel", default=None,
                          help=f"one of: {', '.join(sorted(KERNELS))}")
+    p_kdiff.add_argument("--inline-ptx", default=None, metavar="PATH",
+                         help="read PTX from PATH (or `-` for stdin) "
+                              "instead of a catalogued kernel")
+    p_kdiff.add_argument("--annotate", action="store_true",
+                         help="attach pipeline pass tags (FG33/FG36/...) "
+                              "from verbose openptxas output")
+    p_kdiff.add_argument("--decode-ctrl", action="store_true",
+                         help="decode and append wdep/rbar/stall fields "
+                              "to each instruction line")
+    p_kdiff.add_argument("--field", default=None,
+                         choices=["wdep", "rbar", "stall", "wbar", "yield",
+                                  "misc", "dest", "src0", "src1", "src2",
+                                  "opcode", "bytes"],
+                         help="highlight diffs only when this field "
+                              "differs between ours and ptxas")
+
+    # ---- trace: per-pass log for one kernel ----
+    p_trace = sub.add_parser(
+        "trace",
+        help="show structured per-pass log for one kernel",
+        description="Compile a kernel with verbose pipeline output and emit "
+                    "a structured trace of which passes fired and which "
+                    "instructions each one touched.  Pairs well with `kdiff "
+                    "--annotate` for understanding which pass is responsible "
+                    "for a given byte.",
+    )
+    p_trace.add_argument("--kernel", default=None,
+                         help=f"one of: {', '.join(sorted(KERNELS))}")
+    p_trace.add_argument("--inline-ptx", default=None, metavar="PATH",
+                         help="read PTX from PATH (or `-` for stdin)")
+
+    # ---- wdep-audit: opcode + ctrl-field audit across kernels ----
+    p_wdep = sub.add_parser(
+        "wdep-audit",
+        help="audit wdep/rbar discrepancies vs ptxas across catalogued kernels",
+        description="For every catalogued kernel, compile through both "
+                    "openptxas and ptxas and report instructions whose "
+                    "wdep/rbar control fields differ at matching opcode "
+                    "positions.  Group by (opcode, ours_wdep, ptxas_wdep) "
+                    "so systemic discrepancies become visible.",
+    )
+    p_wdep.add_argument("--kernels", default=None,
+                        help="comma-separated kernel names (default: all)")
+    p_wdep.add_argument("--verbose", action="store_true",
+                        help="show kernel names that hit each discrepancy")
+
+    # ---- hazard-scan: adjacent-pair NOP placement audit ----
+    p_haz = sub.add_parser(
+        "hazard-scan",
+        help="scan adjacent-instruction pairs for NOP placement diffs",
+        description="Walk every catalogued kernel's emitted SASS and "
+                    "tabulate adjacent (producer, consumer) opcode pairs, "
+                    "reporting where ours and ptxas disagree on whether a "
+                    "NOP belongs between them.  Surfaces missing or "
+                    "spurious GPR latency rules.",
+    )
+    p_haz.add_argument("--kernels", default=None,
+                       help="comma-separated kernel names (default: all)")
+
+    # ---- gap-trends: per-kernel sass_non_nop sparkline ----
+    p_gt = sub.add_parser(
+        "gap-trends",
+        help="per-kernel sass_non_nop sparkline across all artifacts",
+        description="Reads results/*_suite_all.json in chronological order "
+                    "and prints a one-line sparkline per kernel showing "
+                    "how its sass_non_nop delta evolved over time.",
+    )
+    p_gt.add_argument("--kernel", default=None,
+                      help="show only this kernel (default: all)")
+    p_gt.add_argument("--limit", type=int, default=None,
+                      help="show only the most recent N artifacts")
+    p_gt.add_argument("--sort", choices=["name", "improvement", "regression"],
+                      default="name",
+                      help="sort order (default: name)")
+    p_gt.add_argument("--results-dir", default=str(DEFAULT_RESULTS_DIR),
+                      help="directory to scan for artifacts")
+
+    # ---- export: dump kernel form to file/stdout ----
+    p_exp = sub.add_parser(
+        "export",
+        help="dump kernel as ptx / cubin / sass / sass-decoded",
+        description="Compile a catalogued (or inline) kernel and dump one "
+                    "of: the original PTX, the cubin bytes, the SASS text, "
+                    "or SASS with decoded ctrl fields.",
+    )
+    p_exp.add_argument("--kernel", default=None,
+                       help=f"one of: {', '.join(sorted(KERNELS))}")
+    p_exp.add_argument("--inline-ptx", default=None, metavar="PATH",
+                       help="read PTX from PATH (or `-` for stdin)")
+    p_exp.add_argument("--format", required=True,
+                       choices=["ptx", "cubin", "sass", "sass-decoded"],
+                       help="output format")
+    p_exp.add_argument("--backend", default="openptxas",
+                       choices=["openptxas", "ptxas"],
+                       help="which assembler to use (cubin/sass/sass-decoded only)")
+    p_exp.add_argument("--out", default=None, metavar="PATH",
+                       help="write to file PATH instead of stdout")
+
+    # ---- sweep: toggle a pass and rerun the suite ----
+    p_sweep = sub.add_parser(
+        "sweep",
+        help="disable PTX passes, rerun suite, show delta vs baseline",
+        description="Set OPENPTXAS_DISABLE_PASSES, run the suite, then "
+                    "print the per-kernel delta vs the most recent prior "
+                    "artifact.  Use to attribute regressions or wins to "
+                    "specific passes.",
+    )
+    p_sweep.add_argument("--passes", required=True,
+                         help=f"comma-separated pass names; available: "
+                              f"{', '.join(_PTX_PASS_NAMES)}")
+    p_sweep.add_argument("--suite", default="all",
+                         help="suite to run (default: all)")
+    p_sweep.add_argument("--results-dir", default=str(DEFAULT_RESULTS_DIR),
+                         help="directory for JSON artifacts")
+
+    # ---- why-fail: bisect passes for a failing kernel ----
+    p_why = sub.add_parser(
+        "why-fail",
+        help="bisect PTX passes to find which one breaks a kernel",
+        description="For a kernel that currently FAILs correctness, "
+                    "iteratively disable passes (right to left) and rerun "
+                    "until correctness is restored.  Reports the smallest "
+                    "disable-set that flips PASS.",
+    )
+    p_why.add_argument("--kernel", required=True,
+                       help=f"one of: {', '.join(sorted(KERNELS))}")
+
+    # ---- guard: CI baseline regression check ----
+    p_grd = sub.add_parser(
+        "guard",
+        help="CI baseline regression check",
+        description="Compare the latest suite_all artifact against a "
+                    "pinned baseline file and exit non-zero if any kernel "
+                    "regressed (new FAIL, new build FAIL, or sass_non_nop "
+                    "delta increased beyond --tolerance).",
+    )
+    p_grd.add_argument("--baseline", required=True, metavar="PATH",
+                       help="path to baseline suite_all.json")
+    p_grd.add_argument("--tolerance", type=int, default=0,
+                       help="allowed sass_non_nop delta increase per "
+                            "kernel before counting as regression")
+    p_grd.add_argument("--results-dir", default=str(DEFAULT_RESULTS_DIR),
+                       help="directory to scan for the latest artifact")
 
     # ---- stress: single-machine GPU correctness loop ----
     p_stress = sub.add_parser(
@@ -4609,6 +5640,22 @@ def main():
         return _cmd_explore(args)
     if args.cmd == "kdiff":
         return _cmd_kdiff(args)
+    if args.cmd == "trace":
+        return _cmd_trace(args)
+    if args.cmd == "wdep-audit":
+        return _cmd_wdep_audit(args)
+    if args.cmd == "hazard-scan":
+        return _cmd_hazard_scan(args)
+    if args.cmd == "gap-trends":
+        return _cmd_gap_trends(args)
+    if args.cmd == "export":
+        return _cmd_export(args)
+    if args.cmd == "sweep":
+        return _cmd_sweep(args)
+    if args.cmd == "why-fail":
+        return _cmd_why_fail(args)
+    if args.cmd == "guard":
+        return _cmd_guard(args)
     if args.cmd == "leaderboard":
         # FG-2 B3: leaderboard is a thin alias over status, so it
         # replays the same saved suite_all artifact.
