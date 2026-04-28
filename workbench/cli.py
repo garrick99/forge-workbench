@@ -4793,6 +4793,8 @@ def _cmd_probe_loop(args):
         max_probes=args.max_probes,
         gpu=not args.no_gpu,
         axes=axes,
+        soak=args.soak,
+        soak_seed=args.soak_seed,
         progress_cb=progress,
     )
     print()
@@ -7144,6 +7146,13 @@ def main():
                       help="comma-separated axis names (default: all)")
     p_pl.add_argument("--no-gpu", action="store_true",
                       help="compile-only mode (skip GPU runs)")
+    p_pl.add_argument("--soak", action="store_true",
+                      help="after coverage saturates, keep producing "
+                           "randomized variant probes until budget/max-probes "
+                           "exhausts.  This is the BelAZ mode — runs until "
+                           "you stop it.")
+    p_pl.add_argument("--soak-seed", type=int, default=0,
+                      help="RNG seed for soak mode (default: 0)")
 
     # ---- probe-stats: print DB summary ----
     p_ps = sub.add_parser(

@@ -169,6 +169,29 @@ RULES: list[Rule] = [
         """,
     ),
     Rule(
+        name="bug_clusters",
+        description=(
+            "Group GPU-incorrect probes by (template_id, target_op, "
+            "target_opcode) tuple.  Surfaces bug *classes* — when the "
+            "soak mode floods the DB with thousands of failing probes "
+            "you don't want to read 5000 individual rows; you want the "
+            "5 bug classes underneath.  Count gives the cluster size; "
+            "min(probe_id) is the canonical reproducer to investigate."
+        ),
+        sql="""
+            SELECT template_id,
+                   target_op,
+                   printf('0x%03x', target_opcode) AS opcode_hex,
+                   COUNT(*) AS n_failing,
+                   MIN(probe_id) AS sample_probe,
+                   MAX(probe_id) AS last_probe
+            FROM probes
+            WHERE gpu_correct = 0 AND error IS NULL
+            GROUP BY template_id, target_op, target_opcode
+            ORDER BY n_failing DESC, template_id, target_op
+        """,
+    ),
+    Rule(
         name="acc_alias_imm_classes_failing",
         description=(
             "From acc_self probes: which (opcode, imm_class) pairs produce "

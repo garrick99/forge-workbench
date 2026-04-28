@@ -2,20 +2,22 @@
 
 Strategies:
   - coverage_greedy:  pick the next unfilled bin from the coverage table.
+  - soak:             after coverage saturates, randomly perturb existing
+                      bins to discover variant bugs (different imms, gaps,
+                      register positions).  Runs forever until budget.
   - anomaly_drilldown: find rows where ours_bytes != ptxas_bytes OR
                        gpu_correct = 0, generate adjacent probes.
   - rule_validation:  for each tentative rule, generate adversarial probes.
-
-For v1 we run coverage_greedy.  Mixed strategies later.
 """
 from __future__ import annotations
 
+import random
 import time
 from typing import Iterator, Optional
 
 from benchmarks.bench_util import CUDAContext
 
-from .coverage import all_axis_bins, synthesize
+from .coverage import all_axis_bins, synthesize, AXES
 from .db import ProbeDB
 from .generator import ProbeSpec
 from .runner import run_probe
@@ -49,11 +51,72 @@ def iter_unfilled(db: ProbeDB,
             break
 
 
+def iter_soak(db: ProbeDB, axes: list[str] | None = None,
+              seed: int = 0) -> Iterator[tuple[str, str, ProbeSpec]]:
+    """After coverage is saturated, keep producing probes by randomly
+    perturbing operand_spec values.  For each axis we pick a random bin,
+    synthesize the spec, then mutate one of:
+      - imm value:   uniform in 2^32, or boundary (0, 1, MAX, sign-flip)
+      - gap:         random in 0..32
+      - pred_thr:    random in 0..256
+      - init_acc:    random in 2^32
+    The bin_key is tagged `<bin>/soak/<seed>` so coverage stays unique."""
+    rng = random.Random(seed)
+    axis_pool = list(axes) if axes else list(AXES.keys())
+    while True:
+        axis = rng.choice(axis_pool)
+        bins_fn, syn_fn = AXES[axis]
+        bins = bins_fn()
+        if not bins:
+            continue
+        bin_key = rng.choice(bins)
+        spec = syn_fn(bin_key)
+        if spec is None:
+            continue
+
+        # Mutate the spec.  We don't deep-copy (ProbeSpec is a dataclass);
+        # build a fresh operand_spec dict.
+        os = dict(spec.operand_spec or {})
+        boundary = (0, 1, 0xFF, 0xFFFF, 0x10000, 0xFFFFFFFF, 0x80000000)
+        if "imm" in os:
+            os["imm"] = rng.choice(boundary) if rng.random() < 0.4 \
+                        else rng.randrange(0, 0xFFFFFFFF)
+        if "gap" in os:
+            os["gap"] = rng.randrange(0, 32)
+        if "pred_thr" in os:
+            os["pred_thr"] = rng.randrange(0, 256)
+        if "init_acc" in os:
+            os["init_acc"] = rng.choice(boundary) if rng.random() < 0.4 \
+                             else rng.randrange(0, 0xFFFFFFFF)
+        if "init_lo" in os:
+            os["init_lo"] = rng.randrange(0, 0xFFFFFFFF)
+        if "init_hi" in os:
+            os["init_hi"] = rng.randrange(0, 0xFFFFFFFF)
+        if "arg" in os:
+            os["arg"] = rng.choice(boundary) if rng.random() < 0.4 \
+                        else rng.randrange(0, 0xFFFFFFFF)
+        # If op_text contains an integer literal, we skip mutation (would
+        # need a parser) — the structured fields above carry most variants.
+
+        new_spec = ProbeSpec(
+            template_id=spec.template_id,
+            target_op=spec.target_op,
+            operand_spec=os,
+            pre_context=list(spec.pre_context),
+            post_context=list(spec.post_context),
+        )
+        # Soak bins use a synthetic key so coverage table doesn't choke.
+        soak_key = f"{bin_key}/soak/{seed}/{rng.randrange(1<<32):08x}"
+        yield axis, soak_key, new_spec
+
+
 def probe_loop(db: ProbeDB,
                budget_seconds: Optional[float] = None,
                max_probes: Optional[int] = None,
                gpu: bool = True,
                axes: list[str] | None = None,
+               soak: bool = False,
+               soak_seed: int = 0,
                progress_cb=None) -> dict:
     """Run the autonomous scheduler.  Returns a stats dict.
 
@@ -80,17 +143,16 @@ def probe_loop(db: ProbeDB,
     n_incorrect = 0
     t_start = time.time()
 
-    try:
-        for axis, bin_key, spec in iter_unfilled(db, axes=axes):
+    def _drive(it):
+        nonlocal n, n_match, n_correct, n_byte_diff, n_incorrect
+        for axis, bin_key, spec in it:
             if deadline and time.time() >= deadline:
-                break
+                return False
             if max_probes is not None and n >= max_probes:
-                break
-
+                return False
             probe_id = run_probe(spec, db, ctx=ctx, gpu=gpu)
             db.mark_covered(axis, bin_key, probe_id)
             n += 1
-
             row = db.query(
                 "SELECT target_byte_match, gpu_correct FROM probes WHERE probe_id = ?",
                 (probe_id,))
@@ -100,9 +162,17 @@ def probe_loop(db: ProbeDB,
                 if gc == 1: n_correct += 1
                 if bm == 0: n_byte_diff += 1
                 if gc == 0: n_incorrect += 1
-
             if progress_cb and n % 25 == 0:
                 progress_cb(n, axis, bin_key)
+        return True
+
+    try:
+        # First fill all unfilled bins (coverage_greedy).
+        finished = _drive(iter_unfilled(db, axes=axes))
+        # If soak requested AND we still have time/probe budget, keep going
+        # with randomized variants until deadline / max_probes.
+        if soak and finished:
+            _drive(iter_soak(db, axes=axes, seed=soak_seed))
     finally:
         if ctx is not None:
             ctx.close()

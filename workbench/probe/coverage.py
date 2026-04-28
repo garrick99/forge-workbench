@@ -4,9 +4,11 @@ synthesizer to materialize a probe spec for that bin.
 """
 from __future__ import annotations
 
+import os
 from typing import Callable, Iterable
 
 from .generator import ProbeSpec
+from . import surface
 
 
 # ---------------------------------------------------------------------------
@@ -568,6 +570,187 @@ def synthesize_fma_op(bin_key: str) -> ProbeSpec | None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Axis 14: auto_dispatch — coverage-driven, generated from sass/isel.py
+#
+# Walks the dispatcher's (op, type-tuple) cells and synthesizes a default
+# probe for each one not already covered by hand-coded axes.  This is the
+# "BelAZ scoop": for every shape our isel claims to handle, at least ONE
+# probe lands.
+#
+# Probe-shape mapping is heuristic — the cleanest match per opcode family.
+# Cells with no clean match are silently skipped (they need a custom
+# template).
+# ---------------------------------------------------------------------------
+
+# Default operand-spec generators per opcode family.  Each takes (op, quals)
+# where quals is a frozenset of types/modifiers.  Returns ProbeSpec or None.
+
+# 32-bit binary ALU: op.{typ} %r2, %r0, %r3
+_AUTO_BINARY_32 = {"add", "sub", "mul", "and", "or", "xor", "min", "max"}
+# 32-bit unary: op.{typ} %r2, %r0
+_AUTO_UNARY_32  = {"not", "neg", "abs", "popc", "clz", "brev", "bfind"}
+# Shift: op.{typ} %r2, %r0, 4
+_AUTO_SHIFT_32  = {"shl", "shr"}
+# Float binary: op.{typ} %f2, %f1, 0f3F800000  (uses alu_f32 template)
+_AUTO_FBIN     = {"add", "sub", "mul", "min", "max", "div"}
+# Conversion: op.{dst}.{src} %r2, %r0
+_AUTO_CVT      = {"cvt"}
+
+_VALID_INT32_TYPES = {"u32", "s32", "b32"}
+_VALID_INT64_TYPES = {"u64", "s64", "b64"}
+_VALID_FLOAT_TYPES = {"f32", "f64"}
+
+
+def _quals_have(quals, *needles):
+    return any(n in quals for n in needles)
+
+
+def _pick_int_type(quals):
+    for t in ("u32", "s32", "b32", "u64", "s64", "b64"):
+        if t in quals:
+            return t
+    return None
+
+
+def _autogen_spec(op: str, quals: frozenset) -> ProbeSpec | None:
+    """Default probe for a (op, quals) cell.  None if no template fits."""
+    typ = _pick_int_type(quals)
+    has_f32 = "f32" in quals
+    has_f64 = "f64" in quals
+    has_lo  = "lo"  in quals
+    has_wide = "wide" in quals
+    has_hi  = "hi"  in quals
+
+    # ---- 32-bit unary integer ----
+    if op in _AUTO_UNARY_32 and typ in _VALID_INT32_TYPES:
+        return ProbeSpec(
+            template_id="alu_unary",
+            target_op=f"{op}.{typ}",
+            operand_spec={"op_text": f"{op}.{typ} %r2, %r0"},
+        )
+
+    # ---- 64-bit unary integer ----
+    if op in _AUTO_UNARY_32 and typ in _VALID_INT64_TYPES:
+        if op in {"popc", "clz", "brev", "bfind"}:
+            return None  # 64-bit variants have different shapes; skip
+        return ProbeSpec(
+            template_id="alu_64bit",
+            target_op=f"{op}.{typ}",
+            operand_spec={"op_text": f"{op}.{typ} %rd2, %rd1"},
+        )
+
+    # ---- 32-bit binary integer (reg-reg variant) ----
+    if op in _AUTO_BINARY_32 and typ in _VALID_INT32_TYPES:
+        return ProbeSpec(
+            template_id="alu_single",
+            target_op=f"{op}.{typ}",
+            operand_spec={"op_text": f"{op}.{typ} %r2, %r0, %r3", "init_acc": 1},
+        )
+
+    # ---- 64-bit binary integer ----
+    if op in _AUTO_BINARY_32 and typ in _VALID_INT64_TYPES:
+        return ProbeSpec(
+            template_id="alu_64bit",
+            target_op=f"{op}.{typ}",
+            operand_spec={"op_text": f"{op}.{typ} %rd2, %rd1, 5"},
+        )
+
+    # ---- shifts (reg-imm variant) ----
+    if op in _AUTO_SHIFT_32 and typ in _VALID_INT32_TYPES:
+        return ProbeSpec(
+            template_id="alu_single",
+            target_op=f"{op}.{typ}",
+            operand_spec={"op_text": f"{op}.{typ} %r2, %r0, 3", "init_acc": 0},
+        )
+    if op in _AUTO_SHIFT_32 and typ in _VALID_INT64_TYPES:
+        return ProbeSpec(
+            template_id="alu_64bit",
+            target_op=f"{op}.{typ}",
+            operand_spec={"op_text": f"{op}.{typ} %rd2, %rd1, 3"},
+        )
+
+    # ---- mad/mul .lo variants ----
+    if op in {"mad", "mul"} and has_lo and typ in _VALID_INT32_TYPES:
+        if op == "mad":
+            text = f"mad.lo.{typ} %r2, %r0, 6, %r3"
+        else:
+            text = f"mul.lo.{typ} %r2, %r0, %r3"
+        return ProbeSpec(
+            template_id="alu_single",
+            target_op=f"{op}.lo.{typ}",
+            operand_spec={"op_text": text, "init_acc": 1},
+        )
+
+    # ---- f32 binary float ----
+    if op in _AUTO_FBIN and has_f32:
+        return ProbeSpec(
+            template_id="alu_f32",
+            target_op=f"{op}.f32",
+            operand_spec={"op_text": f"{op}.f32 %f2, %f1, 0f3F800000"},
+        )
+
+    # ---- fma f32 (3-src) ----
+    if op == "fma" and has_f32:
+        return ProbeSpec(
+            template_id="fma_op",
+            target_op="fma.rn.f32",
+            operand_spec={"typ": "f32",
+                          "k1": "0f3F800000",
+                          "k2": "0f00000000"},
+        )
+
+    # ---- selp (predicated select) ----
+    if op == "selp":
+        sel_typ = "b32"
+        if "u32" in quals: sel_typ = "u32"
+        elif "s32" in quals: sel_typ = "s32"
+        elif "f32" in quals: sel_typ = "f32"
+        return ProbeSpec(
+            template_id="selp_op",
+            target_op=f"selp.{sel_typ}",
+            operand_spec={"typ": sel_typ, "pred_thr": 64,
+                          "a_val": 0xaaaaaaaa, "b_val": 0x55555555},
+        )
+
+    return None  # no template fits — needs custom work (atom, mma, ld/st...)
+
+
+def _isel_path() -> str:
+    """Locate openptxas/sass/isel.py — required for surface enumeration."""
+    return os.environ.get(
+        "OPENPTXAS_ISEL",
+        os.path.expandvars(r"C:\Users\kraken\openptxas\sass\isel.py"),
+    )
+
+
+def _ptx_cells() -> list[tuple[str, frozenset]]:
+    """Cached list of dispatcher cells from isel.py."""
+    return sorted(surface.enumerate_ptx_surface(_isel_path()))
+
+
+def _bin_key(op: str, quals: frozenset) -> str:
+    """Stable string key for an (op, quals) cell."""
+    qs = "_".join(sorted(quals)) if quals else "noquals"
+    return f"{op}/{qs}"
+
+
+def axis_auto_dispatch_bins() -> list[str]:
+    bins: list[str] = []
+    for op, quals in _ptx_cells():
+        if _autogen_spec(op, quals) is None:
+            continue
+        bins.append(_bin_key(op, quals))
+    return sorted(set(bins))
+
+
+def synthesize_auto_dispatch(bin_key: str) -> ProbeSpec | None:
+    for op, quals in _ptx_cells():
+        if _bin_key(op, quals) == bin_key:
+            return _autogen_spec(op, quals)
+    return None
+
+
 AXES: dict[str, tuple[Callable[[], list[str]],
                        Callable[[str], ProbeSpec | None]]] = {
     "opcode_imm_acc":     (axis_opcode_imm_acc_bins,  synthesize_opcode_imm_acc),
@@ -583,6 +766,7 @@ AXES: dict[str, tuple[Callable[[], list[str]],
     "bitfield":           (axis_bitfield_bins,         synthesize_bitfield),
     "selp_op":            (axis_selp_op_bins,          synthesize_selp_op),
     "fma_op":             (axis_fma_op_bins,           synthesize_fma_op),
+    "auto_dispatch":      (axis_auto_dispatch_bins,    synthesize_auto_dispatch),
 }
 
 
