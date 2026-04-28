@@ -4608,11 +4608,17 @@ def _cmd_wdep_audit(args):
         examined += 1
         # Walk by index up to min length; opcode mismatches are ignored
         # here (those are bigger structural diffs that wdep-audit isn't
-        # meant to catch).
+        # meant to catch).  ALSO require b9 to match — many opcodes have
+        # variants that share an opcode field but differ in b9 (e.g.
+        # IADD3.UR low b9=0x10 vs IADD3.UR.X high b9=0x14).  Without this
+        # variant gate, we'd report phantom "rbar mismatches" that are
+        # actually different instructions at the same byte offset.
         for i, (bo, bp) in enumerate(zip(ours, ptxas)):
             opo = _decode_opcode(bo)
             opp = _decode_opcode(bp)
             if opo != opp:
+                continue
+            if bo[9] != bp[9]:
                 continue
             fo = _decode_ctrl_word(bo[13], bo[14], bo[15])
             fp = _decode_ctrl_word(bp[13], bp[14], bp[15])
