@@ -330,6 +330,94 @@ def synthesize_atomic_op(bin_key: str) -> ProbeSpec | None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Axis 8: f32_alu
+#   Bins: {op}/{operand_class}
+#   operand_class:
+#     fresh_const  — %f2 = op(%f1=tid_f, K)
+#     acc_self     — %f2 = op(%f2, K)  (writer reads its own dest)
+#     two_src      — %f2 = op(%f1, %f3=0)
+# ---------------------------------------------------------------------------
+
+# PTX float constants (hex bit-pattern). 0f3F800000 = 1.0, 0fC0000000 = -2.0,
+# 0f40400000 = 3.0, 0f7F800000 = +inf.
+_F32_CONSTS = {
+    "1.0":   "0f3F800000",
+    "0.5":   "0f3F000000",
+    "2.0":   "0f40000000",
+    "3.0":   "0f40400000",
+    "neg1":  "0fBF800000",
+    "tiny":  "0f00800000",   # smallest normal
+    "inf":   "0f7F800000",
+}
+
+_F32_OPS = ("add.f32", "sub.f32", "mul.f32", "min.f32", "max.f32")
+
+
+def axis_f32_alu_bins() -> list[str]:
+    bins = []
+    for op in _F32_OPS:
+        for k_label in _F32_CONSTS:
+            for shape in ("fresh_const", "acc_self"):
+                bins.append(f"{op}/{k_label}/{shape}")
+    return bins
+
+
+def synthesize_f32_alu(bin_key: str) -> ProbeSpec | None:
+    parts = bin_key.split("/")
+    if len(parts) != 3:
+        return None
+    op, k_label, shape = parts
+    k = _F32_CONSTS.get(k_label)
+    if k is None:
+        return None
+    if shape == "fresh_const":
+        op_text = f"{op} %f2, %f1, {k}"
+    else:  # acc_self
+        op_text = f"{op} %f2, %f2, {k}"
+    return ProbeSpec(
+        template_id="alu_f32",
+        target_op=op,
+        operand_spec={"op_text": op_text},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Axis 9: cvt_op
+#   Bins: {dst_type}_from_{src_type}/{rounding}
+#   Matrix of common conversions. Some entries skip rounding when N/A.
+# ---------------------------------------------------------------------------
+
+# Each entry: (cvt_text, pre_context_lines)
+# %r0 = tid (u32 already), %r2 = result (u32 stored).
+_CVT_CASES = {
+    "u32_from_s32":   ("cvt.u32.s32 %r2, %s1",         ["mov.s32 %s1, %r0;"]),
+    "s32_from_u32":   ("cvt.s32.u32 %r2, %r0",         []),
+    "u64_round_trip": ("cvt.u64.u32 %sd1, %r0; cvt.u32.u64 %r2, %sd1", []),
+    "f32_from_u32":   ("cvt.rn.f32.u32 %f1, %r0; mov.b32 %r2, %f1", []),
+    "u32_from_f32":   ("cvt.rn.f32.u32 %f1, %r0; cvt.rzi.u32.f32 %r2, %f1", []),
+    "s32_from_f32":   ("cvt.rn.f32.u32 %f1, %r0; cvt.rzi.s32.f32 %r2, %f1", []),
+    "f32_from_s32":   ("cvt.s32.u32 %s1, %r0; cvt.rn.f32.s32 %f1, %s1; mov.b32 %r2, %f1", []),
+}
+
+
+def axis_cvt_op_bins() -> list[str]:
+    return list(_CVT_CASES.keys())
+
+
+def synthesize_cvt_op(bin_key: str) -> ProbeSpec | None:
+    if bin_key not in _CVT_CASES:
+        return None
+    cvt_text, pre = _CVT_CASES[bin_key]
+    target_op = cvt_text.split(";")[0].split()[0]
+    return ProbeSpec(
+        template_id="cvt_op",
+        target_op=target_op,
+        operand_spec={"cvt_text": cvt_text},
+        pre_context=pre,
+    )
+
+
 AXES: dict[str, tuple[Callable[[], list[str]],
                        Callable[[str], ProbeSpec | None]]] = {
     "opcode_imm_acc":     (axis_opcode_imm_acc_bins,  synthesize_opcode_imm_acc),
@@ -339,6 +427,8 @@ AXES: dict[str, tuple[Callable[[], list[str]],
     "load_consume_gap":   (axis_load_consume_gap_bins, synthesize_load_consume_gap),
     "predicated_alu":     (axis_predicated_alu_bins,   synthesize_predicated_alu),
     "atomic_op":          (axis_atomic_op_bins,        synthesize_atomic_op),
+    "f32_alu":            (axis_f32_alu_bins,          synthesize_f32_alu),
+    "cvt_op":             (axis_cvt_op_bins,           synthesize_cvt_op),
 }
 
 

@@ -365,6 +365,78 @@ def template_atomic_op(spec: ProbeSpec) -> str:
 """
 
 
+# ---------------------------------------------------------------------------
+# Template: alu_f32
+#   Single f32 ALU op.  Inputs come from tid (converted to f32) and a
+#   constant.  Result is bit-cast to u32 and stored.
+#
+#   operand_spec keys:
+#     op_text  : full PTX line, e.g. "add.f32 %f2, %f1, 0f3F800000"
+#                (operands must use %f1 = tid_f, %f2 = result, %f3..%f5 init=0)
+# ---------------------------------------------------------------------------
+
+def template_alu_f32(spec: ProbeSpec) -> str:
+    op_text = spec.operand_spec["op_text"]
+    return f""".version 9.0
+.target sm_120
+.address_size 64
+.visible .entry probe(.param .u64 p_out, .param .u32 n) {{
+    .reg .u32 %r<4>; .reg .u64 %rd<3>; .reg .pred %p0;
+    .reg .f32 %f<6>;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    cvt.rn.f32.u32 %f1, %r0;
+    mov.f32 %f2, 0f00000000;
+    mov.f32 %f3, 0f00000000;
+    mov.f32 %f4, 0f00000000;
+    mov.f32 %f5, 0f00000000;
+    {op_text};
+    mov.b32 %r2, %f2;
+    cvt.u64.u32 %rd1, %r0; shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r2;
+    ret;
+}}
+"""
+
+
+# ---------------------------------------------------------------------------
+# Template: cvt_op
+#   cvt.{dst_type}.{src_type} probing.  Source comes from tid (via mov);
+#   result stored as u32 (bit-cast for f32).
+#
+#   operand_spec keys:
+#     cvt_text : full PTX line, e.g. "cvt.u32.s32 %r2, %r0"
+#                Output must end in %r2 (u32).  For f32→u32, do mov.b32.
+# ---------------------------------------------------------------------------
+
+def template_cvt_op(spec: ProbeSpec) -> str:
+    cvt_text = spec.operand_spec["cvt_text"]
+    pre = "\n    ".join(spec.pre_context)
+    # Compute the destination address FIRST (using %r0 = tid), then run
+    # the cvt operation that produces %r2.  Avoids regalloc trying to
+    # reuse %r0's GPR for %r2.  %rd2 holds the address; the final st
+    # uses %rd2 directly.
+    return f""".version 9.0
+.target sm_120
+.address_size 64
+.visible .entry probe(.param .u64 p_out, .param .u32 n) {{
+    .reg .u32 %r<4>; .reg .u64 %rd<4>; .reg .pred %p0;
+    .reg .f32 %f<4>; .reg .s32 %s<3>; .reg .s64 %sd<3>;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    cvt.u64.u32 %rd1, %r0; shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd2, %rd0, %rd1;
+    {pre}
+    {cvt_text};
+    st.global.u32 [%rd2], %r2;
+    ret;
+}}
+"""
+
+
 TEMPLATES: dict[str, tuple[Callable[[ProbeSpec], str],
                            Callable[[ProbeSpec, int], int | None] | None]] = {
     "alu_single":      (template_alu_single,      None),
@@ -375,6 +447,8 @@ TEMPLATES: dict[str, tuple[Callable[[ProbeSpec], str],
     "load_consume":    (template_load_consume,    None),
     "predicated_alu":  (template_predicated_alu,  None),
     "atomic_op":       (template_atomic_op,       None),
+    "alu_f32":         (template_alu_f32,         None),
+    "cvt_op":          (template_cvt_op,          None),
 }
 
 
