@@ -225,12 +225,156 @@ def expected_latency_sweep(spec: ProbeSpec, tid: int) -> int:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Template: alu_64bit
+#   64-bit ALU op probing (add.u64, sub.u64, and.b64, etc.)
+#   operand_spec keys:
+#     op_text  : full PTX line, e.g. "add.u64 %rd2, %rd1, 100"
+#     init_lo  : low 32 bits of initial %rd1
+#     init_hi  : high 32 bits of initial %rd1
+# ---------------------------------------------------------------------------
+
+def template_alu_64bit(spec: ProbeSpec) -> str:
+    op_text = spec.operand_spec["op_text"]
+    init_lo = spec.operand_spec.get("init_lo", 0)
+    init_hi = spec.operand_spec.get("init_hi", 0)
+    return f""".version 9.0
+.target sm_120
+.address_size 64
+.visible .entry probe(.param .u64 p_out, .param .u32 n) {{
+    .reg .u32 %r<8>; .reg .u64 %rd<6>; .reg .pred %p0;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    cvt.u64.u32 %rd1, %r0;       // %rd1 = tid (zero-ext)
+    add.u64 %rd1, %rd1, {(init_hi << 32) | init_lo};
+    {op_text};
+    cvt.u32.u64 %r2, %rd2;
+    cvt.u64.u32 %rd3, %r0; shl.b64 %rd3, %rd3, 2;
+    add.u64 %rd4, %rd0, %rd3;
+    st.global.u32 [%rd4], %r2;
+    ret;
+}}
+"""
+
+
+# ---------------------------------------------------------------------------
+# Template: load_consume
+#   Load a value from a constant input array, consume via ALU op, store.
+#   Probes LDG → ALU dependency hazards.
+#
+#   operand_spec keys:
+#     consume_op : ALU op consuming the load result, e.g. "add.u32 %r2, %r2, 5"
+#     gap        : number of filler ops between LDG and consumer
+# ---------------------------------------------------------------------------
+
+def template_load_consume(spec: ProbeSpec) -> str:
+    consume_op = spec.operand_spec["consume_op"]
+    gap = spec.operand_spec.get("gap", 0)
+    nops = "\n    ".join(["add.u32 %r3, %r3, 0;"] * gap)
+    return f""".version 9.0
+.target sm_120
+.address_size 64
+.visible .entry probe(.param .u64 p_out, .param .u64 p_in, .param .u32 n) {{
+    .reg .u32 %r<8>; .reg .u64 %rd<5>; .reg .pred %p0;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    ld.param.u64 %rd1, [p_in];
+    mov.u32 %r3, 0;
+    cvt.u64.u32 %rd2, %r0; shl.b64 %rd2, %rd2, 2;
+    add.u64 %rd3, %rd1, %rd2;
+    ld.global.u32 %r2, [%rd3];
+    {nops}
+    {consume_op};
+    add.u64 %rd4, %rd0, %rd2;
+    st.global.u32 [%rd4], %r2;
+    ret;
+}}
+"""
+
+
+# ---------------------------------------------------------------------------
+# Template: predicated_alu
+#   ALU op under a @P0 predicate.  Probes predicate-tracking and
+#   conditional-execution paths in our scoreboard / scheduler.
+#
+#   operand_spec keys:
+#     op_text   : ALU op to predicate (e.g. "add.u32 %r2, %r2, 1")
+#     pred_cond : "lt" / "gt" / "eq" / etc. determining when @P0 fires
+#     pred_thr  : threshold (compares tid with this)
+# ---------------------------------------------------------------------------
+
+def template_predicated_alu(spec: ProbeSpec) -> str:
+    op_text = spec.operand_spec["op_text"]
+    pred_cond = spec.operand_spec.get("pred_cond", "lt")
+    pred_thr = spec.operand_spec.get("pred_thr", 64)
+    init_acc = spec.operand_spec.get("init_acc", 0)
+    return f""".version 9.0
+.target sm_120
+.address_size 64
+.visible .entry probe(.param .u64 p_out, .param .u32 n) {{
+    .reg .u32 %r<8>; .reg .u64 %rd<3>; .reg .pred %p0, %p1;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    mov.u32 %r2, {init_acc};
+    setp.{pred_cond}.u32 %p1, %r0, {pred_thr};
+    @%p1 {op_text};
+    cvt.u64.u32 %rd1, %r0; shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r2;
+    ret;
+}}
+"""
+
+
+# ---------------------------------------------------------------------------
+# Template: atomic_op
+#   atom.global.<op> probing.  Single-threaded (we set n=1) to avoid
+#   the multi-thread atomic chaos; what we're checking is the atomic
+#   instruction's encoding and ctrl-byte assignment.
+#
+#   operand_spec keys:
+#     op       : 'add.u32' | 'or.b32' | 'xor.b32' | 'cas' | etc.
+#     init_val : initial value at the atomic location
+#     arg      : the operand being applied
+# ---------------------------------------------------------------------------
+
+def template_atomic_op(spec: ProbeSpec) -> str:
+    op = spec.operand_spec["op"]
+    arg = spec.operand_spec.get("arg", 1)
+    init_val = spec.operand_spec.get("init_val", 0)
+    return f""".version 9.0
+.target sm_120
+.address_size 64
+.visible .entry probe(.param .u64 p_out, .param .u32 n) {{
+    .reg .u32 %r<8>; .reg .u64 %rd<3>; .reg .pred %p0;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    cvt.u64.u32 %rd1, %r0; shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd2, %rd0, %rd1;
+    mov.u32 %r2, {init_val};
+    st.global.u32 [%rd2], %r2;
+    bar.sync 0;
+    atom.global.{op} %r3, [%rd2], {arg};
+    bar.sync 0;
+    ret;
+}}
+"""
+
+
 TEMPLATES: dict[str, tuple[Callable[[ProbeSpec], str],
                            Callable[[ProbeSpec, int], int | None] | None]] = {
-    "alu_single":     (template_alu_single,    None),
-    "alu_acc_self":   (template_alu_acc_self,  expected_alu_acc_self),
-    "pair_distance":  (template_pair_distance, None),
-    "latency_sweep":  (template_latency_sweep, expected_latency_sweep),
+    "alu_single":      (template_alu_single,      None),
+    "alu_acc_self":    (template_alu_acc_self,    expected_alu_acc_self),
+    "pair_distance":   (template_pair_distance,   None),
+    "latency_sweep":   (template_latency_sweep,   expected_latency_sweep),
+    "alu_64bit":       (template_alu_64bit,       None),
+    "load_consume":    (template_load_consume,    None),
+    "predicated_alu":  (template_predicated_alu,  None),
+    "atomic_op":       (template_atomic_op,       None),
 }
 
 

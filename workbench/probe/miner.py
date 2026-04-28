@@ -69,18 +69,18 @@ RULES: list[Rule] = [
     Rule(
         name="our_bug_candidates",
         description=(
-            "Probes where ours emitted different bytes than ptxas AND GPU "
-            "output is wrong.  Real openptxas codegen bugs we should fix."
+            "Probes where GPU output is wrong AND no compile error — real "
+            "openptxas codegen bugs.  Includes both byte-divergent and "
+            "byte-extraction-failed cases (extraction failure is itself "
+            "a signal: our emission may use an unexpected opcode)."
         ),
         sql="""
-            SELECT probe_id, target_op, operand_spec,
-                   HEX(target_ours_raw) AS ours_bytes,
-                   HEX(target_ptxas_raw) AS ptxas_bytes
+            SELECT probe_id, template_id, target_op, operand_spec
             FROM probes
-            WHERE target_byte_match = 0
-              AND gpu_correct = 0
+            WHERE gpu_correct = 0
               AND error IS NULL
-            LIMIT 50
+            ORDER BY template_id, target_op, probe_id
+            LIMIT 100
         """,
     ),
     Rule(

@@ -182,11 +182,163 @@ def synthesize_latency_writer_gap(bin_key: str) -> ProbeSpec | None:
 # Registry — the scheduler iterates this.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Axis 4: alu_64bit_x_imm
+#   Bins: {op}/{imm_class}
+# ---------------------------------------------------------------------------
+
+_ALU_64_OPS = ("add.u64", "sub.u64", "and.b64", "or.b64", "xor.b64", "shl.b64", "shr.u64")
+
+
+def axis_alu_64bit_imm_bins() -> list[str]:
+    bins = []
+    for op in _ALU_64_OPS:
+        for imm_label in _IMM_CLASSES:
+            bins.append(f"{op}/{imm_label}")
+    return bins
+
+
+def synthesize_alu_64bit_imm(bin_key: str) -> ProbeSpec | None:
+    parts = bin_key.split("/")
+    if len(parts) != 2:
+        return None
+    op, imm_label = parts
+    imm = _IMM_CLASSES.get(imm_label)
+    if imm is None:
+        return None
+    return ProbeSpec(
+        template_id="alu_64bit",
+        target_op=op,
+        operand_spec={"op_text": f"{op} %rd2, %rd1, {imm}"},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Axis 5: load_consume_x_gap
+#   Bins: {consume_op}/gap={N}
+# ---------------------------------------------------------------------------
+
+_LOAD_CONSUME_OPS = (
+    "add.u32 %r2, %r2, 5",
+    "xor.b32 %r2, %r2, 0xff",
+    "mul.lo.u32 %r2, %r2, 7",
+    "shl.b32 %r2, %r2, 2",
+)
+_LOAD_CONSUME_GAPS = [0, 1, 2, 3, 4, 6, 8, 12]
+
+
+def axis_load_consume_gap_bins() -> list[str]:
+    bins = []
+    for op in _LOAD_CONSUME_OPS:
+        label = op.split()[0]
+        for gap in _LOAD_CONSUME_GAPS:
+            bins.append(f"{label}/gap={gap}")
+    return bins
+
+
+def synthesize_load_consume_gap(bin_key: str) -> ProbeSpec | None:
+    parts = bin_key.split("/")
+    if len(parts) != 2:
+        return None
+    label, gap_part = parts
+    if not gap_part.startswith("gap="):
+        return None
+    gap = int(gap_part[4:])
+    for op in _LOAD_CONSUME_OPS:
+        if op.split()[0] == label:
+            return ProbeSpec(
+                template_id="load_consume",
+                target_op=label,
+                operand_spec={"consume_op": op, "gap": gap},
+            )
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Axis 6: predicated_alu_x_op
+#   Bins: {op}/{cond}/thr={N}
+# ---------------------------------------------------------------------------
+
+_PRED_OPS = (
+    "add.u32 %r2, %r2, 1",
+    "xor.b32 %r2, %r2, 0xff",
+    "mul.lo.u32 %r2, %r2, 3",
+)
+_PRED_CONDS = ("lt", "gt", "eq", "ne")
+_PRED_THRS = (0, 32, 64, 127)
+
+
+def axis_predicated_alu_bins() -> list[str]:
+    bins = []
+    for op in _PRED_OPS:
+        label = op.split()[0]
+        for cond in _PRED_CONDS:
+            for thr in _PRED_THRS:
+                bins.append(f"{label}/{cond}/thr={thr}")
+    return bins
+
+
+def synthesize_predicated_alu(bin_key: str) -> ProbeSpec | None:
+    parts = bin_key.split("/")
+    if len(parts) != 3:
+        return None
+    label, cond, thr_part = parts
+    if not thr_part.startswith("thr="):
+        return None
+    thr = int(thr_part[4:])
+    for op in _PRED_OPS:
+        if op.split()[0] == label:
+            return ProbeSpec(
+                template_id="predicated_alu",
+                target_op=label,
+                operand_spec={"op_text": op, "pred_cond": cond, "pred_thr": thr},
+            )
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Axis 7: atomic_x_op
+#   Bins: atom.{op}/init={N}/arg={M}
+# ---------------------------------------------------------------------------
+
+_ATOMIC_OPS = ("add.u32", "and.b32", "or.b32", "xor.b32", "min.u32", "max.u32")
+
+
+def axis_atomic_op_bins() -> list[str]:
+    bins = []
+    for op in _ATOMIC_OPS:
+        for init_val in (0, 1, 0xff):
+            for arg in (1, 7, 0xff):
+                bins.append(f"atom.{op}/init={init_val}/arg={arg}")
+    return bins
+
+
+def synthesize_atomic_op(bin_key: str) -> ProbeSpec | None:
+    parts = bin_key.split("/")
+    if len(parts) != 3:
+        return None
+    op_part, init_part, arg_part = parts
+    if not op_part.startswith("atom."):
+        return None
+    op = op_part[5:]
+    init_val = int(init_part.split("=", 1)[1], 0)
+    arg = int(arg_part.split("=", 1)[1], 0)
+    return ProbeSpec(
+        template_id="atomic_op",
+        target_op=f"atom.global.{op}",
+        operand_spec={"op": op, "init_val": init_val, "arg": arg},
+    )
+
+
 AXES: dict[str, tuple[Callable[[], list[str]],
                        Callable[[str], ProbeSpec | None]]] = {
     "opcode_imm_acc":     (axis_opcode_imm_acc_bins,  synthesize_opcode_imm_acc),
     "hazard_pair_dist":   (axis_hazard_pair_dist_bins, synthesize_hazard_pair_dist),
     "latency_writer_gap": (axis_latency_writer_gap_bins, synthesize_latency_writer_gap),
+    "alu_64bit_imm":      (axis_alu_64bit_imm_bins,    synthesize_alu_64bit_imm),
+    "load_consume_gap":   (axis_load_consume_gap_bins, synthesize_load_consume_gap),
+    "predicated_alu":     (axis_predicated_alu_bins,   synthesize_predicated_alu),
+    "atomic_op":          (axis_atomic_op_bins,        synthesize_atomic_op),
 }
 
 

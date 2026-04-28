@@ -124,7 +124,10 @@ def _find_target(text: bytes, target_op: str) -> tuple[int, bytes] | None:
 # ---------------------------------------------------------------------------
 
 def _run_cubin(ctx: CUDAContext, cubin: bytes,
-               n_threads: int = N_THREADS) -> bytes | None:
+               n_threads: int = N_THREADS,
+               extra_buf: bool = False) -> bytes | None:
+    """Launch probe kernel.  If extra_buf=True, allocate and pass a
+    zeroed p_in buffer (for templates with .param .u64 p_in)."""
     if not ctx.load(cubin):
         return None
     try:
@@ -133,22 +136,36 @@ def _run_cubin(ctx: CUDAContext, cubin: bytes,
         return None
     out_dev = ctx.alloc(n_threads * 4)
     ctx.memset_d8(out_dev, 0, n_threads * 4)
+    in_dev = None
+    if extra_buf:
+        in_dev = ctx.alloc(n_threads * 4)
+        ctx.memset_d8(in_dev, 0, n_threads * 4)
 
     p_out = ctypes.c_uint64(out_dev)
     n_val = ctypes.c_uint32(n_threads)
-    args = (ctypes.c_void_p * 2)(
-        ctypes.cast(ctypes.byref(p_out), ctypes.c_void_p),
-        ctypes.cast(ctypes.byref(n_val), ctypes.c_void_p))
+    if extra_buf:
+        p_in = ctypes.c_uint64(in_dev)
+        args = (ctypes.c_void_p * 3)(
+            ctypes.cast(ctypes.byref(p_out), ctypes.c_void_p),
+            ctypes.cast(ctypes.byref(p_in), ctypes.c_void_p),
+            ctypes.cast(ctypes.byref(n_val), ctypes.c_void_p))
+    else:
+        args = (ctypes.c_void_p * 2)(
+            ctypes.cast(ctypes.byref(p_out), ctypes.c_void_p),
+            ctypes.cast(ctypes.byref(n_val), ctypes.c_void_p))
 
     rc = ctx.launch(func, (1, 1, 1), (n_threads, 1, 1), args)
     if rc != 0:
         ctx.free(out_dev)
+        if in_dev: ctx.free(in_dev)
         return None
     if ctx.sync() != 0:
         ctx.free(out_dev)
+        if in_dev: ctx.free(in_dev)
         return None
     raw = ctx.copy_from(out_dev, n_threads * 4)
     ctx.free(out_dev)
+    if in_dev: ctx.free(in_dev)
     return raw
 
 
@@ -244,9 +261,10 @@ def run_probe(spec: ProbeSpec, db: ProbeDB,
 
     # ---- GPU run + correctness check ----
     if gpu and ctx is not None:
-        runtimes = []
-        ours_out = _run_cubin(ctx, ours_cubin)
-        ptxas_out = _run_cubin(ctx, ptxas_cubin)
+        # Templates with a 3rd param (p_in) need the extra buffer.
+        extra = spec.template_id in ("load_consume",)
+        ours_out = _run_cubin(ctx, ours_cubin, extra_buf=extra)
+        ptxas_out = _run_cubin(ctx, ptxas_cubin, extra_buf=extra)
         if ours_out is not None and ptxas_out is not None:
             # ours is correct iff its output matches both the expected
             # function (if known) AND ptxas's output (oracle).
