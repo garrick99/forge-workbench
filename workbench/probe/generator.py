@@ -437,6 +437,145 @@ def template_cvt_op(spec: ProbeSpec) -> str:
 """
 
 
+# ---------------------------------------------------------------------------
+# Template: alu_unary
+#   Single unary op of shape `op.<typ> %r2, %r0;` — for not, neg, abs,
+#   popc, clz, brev, bfind, etc.  Reuses alu_single's structure but
+#   isolates intent (and gives a place to specialize if needed).
+#
+#   operand_spec keys:
+#     op_text  : full PTX line, e.g. "popc.b32 %r2, %r0"
+# ---------------------------------------------------------------------------
+
+def template_alu_unary(spec: ProbeSpec) -> str:
+    op_text = spec.operand_spec["op_text"]
+    return f""".version 9.0
+.target sm_120
+.address_size 64
+.visible .entry probe(.param .u64 p_out, .param .u32 n) {{
+    .reg .u32 %r<8>; .reg .u64 %rd<3>; .reg .pred %p0;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    {op_text};
+    cvt.u64.u32 %rd1, %r0; shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r2;
+    ret;
+}}
+"""
+
+
+# ---------------------------------------------------------------------------
+# Template: bitfield
+#   bfe / bfi probes — inputs from tid + per-thread varying state so
+#   different thread lanes see different bit positions / masks.
+#
+#   operand_spec keys:
+#     op_text  : full PTX line.  May reference %r0 (tid), %r3 (=tid&31
+#                = bit position), %r4 (=8, length), %r5 (=0xa5a5a5a5 mask)
+# ---------------------------------------------------------------------------
+
+def template_bitfield(spec: ProbeSpec) -> str:
+    op_text = spec.operand_spec["op_text"]
+    return f""".version 9.0
+.target sm_120
+.address_size 64
+.visible .entry probe(.param .u64 p_out, .param .u32 n) {{
+    .reg .u32 %r<8>; .reg .u64 %rd<3>; .reg .pred %p0;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    and.b32 %r3, %r0, 31;
+    mov.u32 %r4, 8;
+    mov.u32 %r5, 0xa5a5a5a5;
+    mov.u32 %r6, 0xdeadbeef;
+    {op_text};
+    cvt.u64.u32 %rd1, %r0; shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r2;
+    ret;
+}}
+"""
+
+
+# ---------------------------------------------------------------------------
+# Template: selp_op
+#   selp.<typ> %r2, A, B, %p0 — predicated select.  The probe sets %p0
+#   from setp on tid so each thread takes a different branch.
+#
+#   operand_spec keys:
+#     typ      : 'b32' / 'u32' / 'f32' (the selp type)
+#     a_val    : true-branch value
+#     b_val    : false-branch value
+#     pred_thr : tid threshold for setp.lt
+# ---------------------------------------------------------------------------
+
+def template_selp_op(spec: ProbeSpec) -> str:
+    typ = spec.operand_spec.get("typ", "b32")
+    a_val = spec.operand_spec.get("a_val", 0xaaaaaaaa)
+    b_val = spec.operand_spec.get("b_val", 0x55555555)
+    pred_thr = spec.operand_spec.get("pred_thr", 64)
+    return f""".version 9.0
+.target sm_120
+.address_size 64
+.visible .entry probe(.param .u64 p_out, .param .u32 n) {{
+    .reg .u32 %r<8>; .reg .u64 %rd<3>; .reg .pred %p0, %p1;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    setp.lt.u32 %p1, %r0, {pred_thr};
+    selp.{typ} %r2, {a_val}, {b_val}, %p1;
+    cvt.u64.u32 %rd1, %r0; shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r2;
+    ret;
+}}
+"""
+
+
+# ---------------------------------------------------------------------------
+# Template: fma_op
+#   fma.rn.f32 %f2, %f1, %f3, %f4 — fused multiply-add.  Inputs from tid
+#   plus float constants.  Result bit-cast back to u32 for storage.
+#
+#   operand_spec keys:
+#     typ      : 'f32' / 'f64'
+#     k1       : multiplier constant (PTX float literal, e.g. "0f3F800000")
+#     k2       : addend constant
+# ---------------------------------------------------------------------------
+
+def template_fma_op(spec: ProbeSpec) -> str:
+    typ = spec.operand_spec.get("typ", "f32")
+    k1 = spec.operand_spec.get("k1", "0f3F800000")
+    k2 = spec.operand_spec.get("k2", "0f00000000")
+    if typ == "f32":
+        body = f"""    cvt.rn.f32.u32 %f1, %r0;
+    fma.rn.f32 %f2, %f1, {k1}, {k2};
+    mov.b32 %r2, %f2;"""
+    else:  # f64
+        body = f"""    cvt.rn.f64.u32 %fd1, %r0;
+    fma.rn.f64 %fd2, %fd1, 0d3FF0000000000000, 0d0000000000000000;
+    cvt.rn.f32.f64 %f2, %fd2;
+    mov.b32 %r2, %f2;"""
+    return f""".version 9.0
+.target sm_120
+.address_size 64
+.visible .entry probe(.param .u64 p_out, .param .u32 n) {{
+    .reg .u32 %r<4>; .reg .u64 %rd<3>; .reg .pred %p0;
+    .reg .f32 %f<4>; .reg .f64 %fd<3>;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+{body}
+    cvt.u64.u32 %rd1, %r0; shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r2;
+    ret;
+}}
+"""
+
+
 TEMPLATES: dict[str, tuple[Callable[[ProbeSpec], str],
                            Callable[[ProbeSpec, int], int | None] | None]] = {
     "alu_single":      (template_alu_single,      None),
@@ -449,6 +588,10 @@ TEMPLATES: dict[str, tuple[Callable[[ProbeSpec], str],
     "atomic_op":       (template_atomic_op,       None),
     "alu_f32":         (template_alu_f32,         None),
     "cvt_op":          (template_cvt_op,          None),
+    "alu_unary":       (template_alu_unary,       None),
+    "bitfield":        (template_bitfield,        None),
+    "selp_op":         (template_selp_op,         None),
+    "fma_op":          (template_fma_op,          None),
 }
 
 

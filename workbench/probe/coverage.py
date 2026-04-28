@@ -418,6 +418,156 @@ def synthesize_cvt_op(bin_key: str) -> ProbeSpec | None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Axis 10: alu_unary
+#   Bins: {op}.{typ}
+# ---------------------------------------------------------------------------
+
+_UNARY_OPS = (
+    ("not.b32",   "not.b32 %r2, %r0"),
+    ("not.b64",   "not.b64 %rd2, %rd1"),  # placeholder; emit handled by 64-bit branch
+    ("neg.s32",   "neg.s32 %r2, %r0"),
+    ("neg.s64",   "neg.s64 %rd2, %rd1"),
+    ("abs.s32",   "abs.s32 %r2, %r0"),
+    ("abs.s64",   "abs.s64 %rd2, %rd1"),
+    ("popc.b32",  "popc.b32 %r2, %r0"),
+    ("clz.b32",   "clz.b32 %r2, %r0"),
+    ("brev.b32",  "brev.b32 %r2, %r0"),
+    ("bfind.u32", "bfind.u32 %r2, %r0"),
+)
+
+
+def axis_alu_unary_bins() -> list[str]:
+    return [label for label, _ in _UNARY_OPS]
+
+
+def synthesize_alu_unary(bin_key: str) -> ProbeSpec | None:
+    for label, op_text in _UNARY_OPS:
+        if label == bin_key:
+            # 64-bit unary ops use alu_64bit shape; rest fit alu_unary
+            if "64" in label and label != "popc.b64":
+                return ProbeSpec(
+                    template_id="alu_64bit",
+                    target_op=label,
+                    operand_spec={"op_text": op_text},
+                )
+            return ProbeSpec(
+                template_id="alu_unary",
+                target_op=label,
+                operand_spec={"op_text": op_text},
+            )
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Axis 11: bitfield (bfe / bfi)
+#   Bins: {op}/{shape}
+#   shape: imm_pos_imm_len  | reg_pos_reg_len  | edge_high_bit
+# ---------------------------------------------------------------------------
+
+_BITFIELD_BINS = {
+    "bfe.u32/imm_8_8":      "bfe.u32 %r2, %r5, 8, 8",
+    "bfe.u32/imm_0_4":      "bfe.u32 %r2, %r5, 0, 4",
+    "bfe.u32/imm_28_4":     "bfe.u32 %r2, %r6, 28, 4",
+    "bfe.u32/reg_pos_imm":  "bfe.u32 %r2, %r5, %r3, 8",
+    "bfe.s32/imm_8_8":      "bfe.s32 %r2, %r6, 8, 8",
+    "bfe.s32/imm_28_4":     "bfe.s32 %r2, %r6, 28, 4",
+    "bfi.b32/imm_8_8":      "bfi.b32 %r2, %r0, %r5, 8, 8",
+    "bfi.b32/imm_0_4":      "bfi.b32 %r2, %r0, %r5, 0, 4",
+    "bfi.b32/imm_24_8":     "bfi.b32 %r2, %r0, %r5, 24, 8",
+}
+
+
+def axis_bitfield_bins() -> list[str]:
+    return list(_BITFIELD_BINS.keys())
+
+
+def synthesize_bitfield(bin_key: str) -> ProbeSpec | None:
+    op_text = _BITFIELD_BINS.get(bin_key)
+    if op_text is None:
+        return None
+    target_op = op_text.split()[0]
+    return ProbeSpec(
+        template_id="bitfield",
+        target_op=target_op,
+        operand_spec={"op_text": op_text},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Axis 12: selp_op
+#   Bins: {typ}/thr={N}
+# ---------------------------------------------------------------------------
+
+_SELP_TYPES = ("b32", "u32", "s32", "f32")
+_SELP_THRS  = (0, 1, 32, 64, 127)
+
+
+def axis_selp_op_bins() -> list[str]:
+    return [f"{t}/thr={n}" for t in _SELP_TYPES for n in _SELP_THRS]
+
+
+def synthesize_selp_op(bin_key: str) -> ProbeSpec | None:
+    parts = bin_key.split("/")
+    if len(parts) != 2:
+        return None
+    typ, thr_part = parts
+    if not thr_part.startswith("thr="):
+        return None
+    thr = int(thr_part[4:])
+    return ProbeSpec(
+        template_id="selp_op",
+        target_op=f"selp.{typ}",
+        operand_spec={"typ": typ, "pred_thr": thr,
+                      "a_val": 0xaaaaaaaa, "b_val": 0x55555555},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Axis 13: fma_op
+#   Bins: {typ}/{k1_label}_{k2_label}
+# ---------------------------------------------------------------------------
+
+_FMA_K1S = {
+    "1.0":   "0f3F800000",
+    "2.0":   "0f40000000",
+    "0.5":   "0f3F000000",
+    "tiny":  "0f00800000",
+}
+_FMA_K2S = {
+    "0.0":   "0f00000000",
+    "1.0":   "0f3F800000",
+    "neg1":  "0fBF800000",
+}
+
+
+def axis_fma_op_bins() -> list[str]:
+    bins = []
+    for k1 in _FMA_K1S:
+        for k2 in _FMA_K2S:
+            bins.append(f"f32/{k1}_{k2}")
+    return bins
+
+
+def synthesize_fma_op(bin_key: str) -> ProbeSpec | None:
+    parts = bin_key.split("/")
+    if len(parts) != 2:
+        return None
+    typ, k_part = parts
+    if "_" not in k_part:
+        return None
+    k1_lbl, k2_lbl = k_part.split("_", 1)
+    k1 = _FMA_K1S.get(k1_lbl)
+    k2 = _FMA_K2S.get(k2_lbl)
+    if k1 is None or k2 is None:
+        return None
+    return ProbeSpec(
+        template_id="fma_op",
+        target_op=f"fma.rn.{typ}",
+        operand_spec={"typ": typ, "k1": k1, "k2": k2},
+    )
+
+
 AXES: dict[str, tuple[Callable[[], list[str]],
                        Callable[[str], ProbeSpec | None]]] = {
     "opcode_imm_acc":     (axis_opcode_imm_acc_bins,  synthesize_opcode_imm_acc),
@@ -429,6 +579,10 @@ AXES: dict[str, tuple[Callable[[], list[str]],
     "atomic_op":          (axis_atomic_op_bins,        synthesize_atomic_op),
     "f32_alu":            (axis_f32_alu_bins,          synthesize_f32_alu),
     "cvt_op":             (axis_cvt_op_bins,           synthesize_cvt_op),
+    "alu_unary":          (axis_alu_unary_bins,        synthesize_alu_unary),
+    "bitfield":           (axis_bitfield_bins,         synthesize_bitfield),
+    "selp_op":            (axis_selp_op_bins,          synthesize_selp_op),
+    "fma_op":             (axis_fma_op_bins,           synthesize_fma_op),
 }
 
 

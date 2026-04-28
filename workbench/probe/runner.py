@@ -99,6 +99,38 @@ _PTX_TO_SASS_OPCODE_HINTS = {
     "shr.b32":      {0x819},
     "sub.u32":      {0x210, 0x810, 0x835},
     "sub.s32":      {0x210, 0x810, 0x835},
+    # Unary
+    "not.b32":      {0x812, 0x212},                         # LOP3.NOT
+    "neg.s32":      {0x210, 0x810, 0x835},                  # IADD3 with neg
+    "abs.s32":      {0x213, 0x813},                         # IABS
+    "popc.b32":     {0x309},                                # POPC
+    "clz.b32":      {0x317, 0x210, 0x810},                  # FLO + IADD3
+    "brev.b32":     {0x301},                                # BREV
+    "bfind.u32":    {0x317, 0x310},                         # FLO/BFIND
+    # Bitfield
+    "bfe.u32":      {0x310, 0x319},                         # BFE/IBFE
+    "bfe.s32":      {0x310, 0x319},
+    "bfi.b32":      {0x311, 0x31a},                         # BFI
+    # Predicate select
+    "selp.b32":     {0x807, 0x210, 0x810},                  # SEL or PREDMOV
+    "selp.u32":     {0x807, 0x210, 0x810},
+    "selp.s32":     {0x807, 0x210, 0x810},
+    "selp.f32":     {0x807, 0x210, 0x810},
+    # Float
+    "add.f32":      {0x221, 0x421, 0x821},
+    "sub.f32":      {0x221, 0x421, 0x821},
+    "mul.f32":      {0x220, 0x820},
+    "min.f32":      {0x209, 0x809},
+    "max.f32":      {0x209, 0x809},
+    "fma.rn.f32":   {0x223, 0x423, 0x823},                  # FFMA
+    "fma.rn.f64":   {0x222, 0x822},                         # DFMA
+    # Conversions
+    "cvt.s32.u32":  {0x305, 0x245},                         # I2I
+    "cvt.u32.s32":  {0x305, 0x245},
+    "cvt.rn.f32.u32": {0x245},                              # I2FP
+    "cvt.rn.f32.s32": {0x245},
+    "cvt.rzi.u32.f32": {0x305},                             # F2I
+    "cvt.rzi.s32.f32": {0x305},
 }
 
 
