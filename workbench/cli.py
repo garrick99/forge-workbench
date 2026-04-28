@@ -108,6 +108,7 @@ ROOT       = STACK_ROOT / "openptxas"  # back-compat alias; old code used `ROOT`
 # land (e.g. cd into a project dir then run workbench; results stay there).
 # Override per-command with --results-dir / --out-dir if needed.
 DEFAULT_RESULTS_DIR = Path.cwd() / "results"
+DEFAULT_PROBE_DIR = Path.cwd() / "probes"
 DEFAULT_STRESS_DIR  = Path.cwd() / "stress_runs"
 
 
@@ -4758,6 +4759,103 @@ def _cmd_hazard_scan(args):
     return 0
 
 
+def _cmd_probe_init(args):
+    from workbench.probe import ProbeDB, seed_all_axes
+    db = ProbeDB(args.probe_dir)
+    n_seeded = seed_all_axes(db)
+    print(f"probe-init: DB at {db.db_path}")
+    print(f"           cubin store at {db.root / 'cubin'}")
+    print(f"           PTX store at {db.root / 'ptx'}")
+    print(f"  seeded {n_seeded} new coverage bins")
+    print()
+    print("  axis breakdown:")
+    for axis, filled, total in db.coverage_summary():
+        print(f"    {axis:<24s}  {filled:>5d} / {total:<5d} filled")
+    db.close()
+    return 0
+
+
+def _cmd_probe_loop(args):
+    from workbench.probe import ProbeDB, probe_loop
+    db = ProbeDB(args.probe_dir)
+    axes = [a.strip() for a in args.axes.split(",")] if args.axes else None
+
+    def progress(n, axis, bin_key):
+        print(f"  [{n:>5d}] {axis:<22s}  {bin_key}", flush=True)
+
+    print(f"probe-loop: probe-dir={args.probe_dir}")
+    print(f"  budget={args.budget}s  max_probes={args.max_probes}  "
+          f"gpu={'no' if args.no_gpu else 'yes'}  axes={axes or 'all'}")
+    print()
+
+    stats = probe_loop(
+        db, budget_seconds=args.budget,
+        max_probes=args.max_probes,
+        gpu=not args.no_gpu,
+        axes=axes,
+        progress_cb=progress,
+    )
+    print()
+    print(f"  done: {stats['probes_run']} probes in {stats['elapsed_s']:.1f}s "
+          f"({stats['rate_per_s']:.1f}/s)")
+    print(f"    byte_match={stats['byte_match']}  byte_diff={stats['byte_diff']}")
+    print(f"    gpu_correct={stats['gpu_correct']}  gpu_incorrect={stats['gpu_incorrect']}")
+    db.close()
+    return 0
+
+
+def _cmd_probe_stats(args):
+    from workbench.probe import ProbeDB
+    db = ProbeDB(args.probe_dir)
+    stats = db.stats()
+    print(f"probe-stats: {db.db_path}")
+    print(f"  total probes:      {stats['total']}")
+    print(f"  byte_match:        {stats['byte_matches']}")
+    print(f"  gpu_correct:       {stats['correct']}")
+    print(f"  gpu_incorrect:     {stats['incorrect']}")
+    print(f"  errors:            {stats['errors']}")
+    print()
+    print("  coverage by axis:")
+    for axis, filled, total in db.coverage_summary():
+        pct = filled / total * 100 if total else 0
+        print(f"    {axis:<24s}  {filled:>5d} / {total:<5d}  ({pct:5.1f}%)")
+    db.close()
+    return 0
+
+
+def _cmd_probe_mine(args):
+    from workbench.probe import ProbeDB, RULES, run_all_rules, print_rule_summary
+    db = ProbeDB(args.probe_dir)
+    if args.rule:
+        rules = [r for r in RULES if r.name == args.rule]
+        if not rules:
+            print(f"workbench probe-mine: unknown rule '{args.rule}'",
+                  file=sys.stderr)
+            print(f"  known: {', '.join(r.name for r in RULES)}", file=sys.stderr)
+            return 2
+        results = {r.name: r.execute(db) for r in rules}
+    else:
+        results = run_all_rules(db)
+    print_rule_summary(results)
+    db.close()
+    return 0
+
+
+def _cmd_probe_query(args):
+    from workbench.probe import ProbeDB
+    db = ProbeDB(args.probe_dir)
+    try:
+        rows = db.query(args.sql)
+    except Exception as e:
+        print(f"workbench probe-query: {type(e).__name__}: {e}", file=sys.stderr)
+        return 1
+    for r in rows:
+        print(r)
+    print(f"\n{len(rows)} row(s)")
+    db.close()
+    return 0
+
+
 def _cmd_disasm(args):
     """Decode a hex-encoded SASS instruction (16 bytes) into mnemonic +
     field breakdown.  Inverse of `encode`.  Useful when staring at raw
@@ -6968,6 +7066,64 @@ def main():
     p_ef.add_argument("--imm-range", default=None,
                       help='range like "1..16" or comma list "1,3,5,7"')
 
+    # ---- probe-init: bootstrap the probe DB ----
+    p_pi_init = sub.add_parser(
+        "probe-init",
+        help="initialize the probe DB and seed coverage axes",
+        description="Create probes/probes.sqlite + content-addressed cubin "
+                    "and PTX directories.  Seed all coverage axes with "
+                    "their bin sets at visit_count=0.  Idempotent.")
+    p_pi_init.add_argument("--probe-dir", default=str(DEFAULT_PROBE_DIR),
+                           help="root directory for the probe DB + objects")
+
+    # ---- probe-loop: run autonomous probe loop ----
+    p_pl = sub.add_parser(
+        "probe-loop",
+        help="run the autonomous SM_120 probe loop until budget runs out",
+        description="Pick unfilled bins from the coverage table, materialize "
+                    "PTX probes from registered templates, compile through "
+                    "ptxas + openptxas, run on GPU, and store everything "
+                    "in the probe DB.  Stops on budget OR max-probes OR "
+                    "all bins covered.")
+    p_pl.add_argument("--probe-dir", default=str(DEFAULT_PROBE_DIR))
+    p_pl.add_argument("--budget", type=float, default=None,
+                      help="time budget in seconds (default: until exhausted)")
+    p_pl.add_argument("--max-probes", type=int, default=None,
+                      help="hard cap on number of probes to run")
+    p_pl.add_argument("--axes", default=None,
+                      help="comma-separated axis names (default: all)")
+    p_pl.add_argument("--no-gpu", action="store_true",
+                      help="compile-only mode (skip GPU runs)")
+
+    # ---- probe-stats: print DB summary ----
+    p_ps = sub.add_parser(
+        "probe-stats",
+        help="show probe DB summary + coverage breakdown",
+        description="Counts of probes, byte matches, GPU correct/incorrect, "
+                    "errors; coverage breakdown per axis.")
+    p_ps.add_argument("--probe-dir", default=str(DEFAULT_PROBE_DIR))
+
+    # ---- probe-mine: run all rule queries ----
+    p_pm2 = sub.add_parser(
+        "probe-mine",
+        help="run every rule extractor against the probe DB",
+        description="SQL-based pattern extraction over the probe DB.  "
+                    "Surfaces hardware bug candidates, our codegen bugs, "
+                    "wdep distributions, hardware latency requirements, "
+                    "etc.")
+    p_pm2.add_argument("--probe-dir", default=str(DEFAULT_PROBE_DIR))
+    p_pm2.add_argument("--rule", default=None,
+                       help="run a single rule by name (default: all)")
+
+    # ---- probe-query: ad-hoc SQL ----
+    p_pq = sub.add_parser(
+        "probe-query",
+        help="ad-hoc SQL query against the probe DB",
+        description="Runs a SELECT query against probes.sqlite.  Use for "
+                    "exploratory analysis.")
+    p_pq.add_argument("sql", help="SQL query to execute")
+    p_pq.add_argument("--probe-dir", default=str(DEFAULT_PROBE_DIR))
+
     # ---- stress: single-machine GPU correctness loop ----
     p_stress = sub.add_parser(
         "stress",
@@ -7123,6 +7279,16 @@ def main():
         return _cmd_provenance(args)
     if args.cmd == "forge-trace":
         return _cmd_forge_trace(args)
+    if args.cmd == "probe-init":
+        return _cmd_probe_init(args)
+    if args.cmd == "probe-loop":
+        return _cmd_probe_loop(args)
+    if args.cmd == "probe-stats":
+        return _cmd_probe_stats(args)
+    if args.cmd == "probe-mine":
+        return _cmd_probe_mine(args)
+    if args.cmd == "probe-query":
+        return _cmd_probe_query(args)
     if args.cmd == "encode-fuzz":
         return _cmd_encode_fuzz(args)
     if args.cmd == "leaderboard":
