@@ -39,6 +39,10 @@ def template_alu_single(spec: ProbeSpec) -> str:
     op_text = spec.operand_spec["op_text"]
     pre = "\n    ".join(spec.pre_context)
     post = "\n    ".join(spec.post_context)
+    # Init %r2..%r6 to deterministic values so probes can use any of them
+    # as src/dest without uninitialized-read issues.  %r0 is %tid.x; %r1
+    # is the n param (used by the early-exit setp); the rest start at
+    # known small constants.
     return f""".version 9.0
 .target sm_120
 .address_size 64
@@ -48,6 +52,10 @@ def template_alu_single(spec: ProbeSpec) -> str:
     ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
     ld.param.u64 %rd0, [p_out];
     mov.u32 %r2, {init_acc};
+    mov.u32 %r3, 0;
+    mov.u32 %r4, 0;
+    mov.u32 %r5, 0;
+    mov.u32 %r6, 0;
     {pre}
     {op_text};
     {post}
@@ -130,6 +138,7 @@ def template_pair_distance(spec: ProbeSpec) -> str:
     mov.u32 %r0, %tid.x;
     ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
     ld.param.u64 %rd0, [p_out];
+    mov.u32 %r2, 0;
     mov.u32 %r3, 0;
     {pre}
     {op_a};
