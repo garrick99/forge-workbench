@@ -4841,6 +4841,56 @@ def _cmd_probe_mine(args):
     return 0
 
 
+def _cmd_probe_survey(args):
+    """Field-size report: how big is the surface, and how much have we mown?"""
+    from workbench.probe import ProbeDB
+    from workbench.probe.surface import survey
+    import os.path as _osp
+
+    isel = args.isel_path or _osp.expandvars(
+        r"C:\Users\kraken\openptxas\sass\isel.py")
+    db = ProbeDB(args.probe_dir)
+    rep = survey(db, isel)
+
+    px = rep["ptx_surface"]
+    sx = rep["sass_surface"]
+    print(f"probe-survey: {db.db_path}")
+    print(f"  isel.py: {isel}")
+    print()
+    print("  PTX dispatcher surface (the front of the field):")
+    print(f"    distinct ops:     {px['distinct_ops']}")
+    print(f"    total cells:      {px['total_cells']}")
+    def _pct(n, d): return (n / d * 100) if d else 0.0
+    print(f"    targeted cells:   {px['targeted_cells']:>4d} / {px['total_cells']}  "
+          f"({_pct(px['targeted_cells'], px['total_cells']):5.1f}%)   "
+          f"<- probes specifically zoom in on these")
+    print(f"    exercised cells:  {px['exercised_cells']:>4d} / {px['total_cells']}  "
+          f"({_pct(px['exercised_cells'], px['total_cells']):5.1f}%)   "
+          f"<- any probe's PTX touches these")
+    print(f"    targeted ops:     {px['targeted_ops']:>4d} / {px['distinct_ops']}  "
+          f"({_pct(px['targeted_ops'], px['distinct_ops']):5.1f}%)")
+    print(f"    exercised ops:    {px['exercised_ops']:>4d} / {px['distinct_ops']}  "
+          f"({_pct(px['exercised_ops'], px['distinct_ops']):5.1f}%)")
+    if px["unexercised_ops"]:
+        print(f"    never-exercised:  {', '.join(px['unexercised_ops'])}")
+    print()
+    print("  SASS opcode surface (the back — what we actually emit):")
+    print(f"    distinct opcodes seen:  {sx['distinct_opcodes']}")
+    if args.verbose and sx["opcodes_seen"]:
+        print(f"    opcodes:")
+        for opc in sx["opcodes_seen"]:
+            d = sx["details"][opc]
+            print(f"      0x{opc:03x}  ours={d['ours_count']:>4d}  "
+                  f"ptxas={d['ptxas_count']:>4d}  "
+                  f"first@probe_id={d['first_probe_id']}")
+    print()
+    print("  Per-op cell counts (PTX):")
+    for op, n in sorted(px["by_op"].items(), key=lambda kv: (-kv[1], kv[0])):
+        print(f"    {op:<14s}  {n:>3d} cells")
+    db.close()
+    return 0
+
+
 def _cmd_probe_query(args):
     from workbench.probe import ProbeDB
     db = ProbeDB(args.probe_dir)
@@ -7115,6 +7165,22 @@ def main():
     p_pm2.add_argument("--rule", default=None,
                        help="run a single rule by name (default: all)")
 
+    # ---- probe-survey: size the field ----
+    p_psv = sub.add_parser(
+        "probe-survey",
+        help="report PTX/SASS surface size and how much we've covered",
+        description="Sizes the field the probe mower is mowing. Reports the "
+                    "set of (op, type) cells the openptxas dispatcher knows "
+                    "about (PTX surface), what fraction the probes have "
+                    "exercised, and the distinct SASS opcodes we've actually "
+                    "emitted into cubins.")
+    p_psv.add_argument("--probe-dir", default=str(DEFAULT_PROBE_DIR))
+    p_psv.add_argument("--isel-path", default=None,
+                       help="path to openptxas/sass/isel.py "
+                            "(default: ~/openptxas/sass/isel.py)")
+    p_psv.add_argument("--verbose", "-v", action="store_true",
+                       help="list every distinct SASS opcode")
+
     # ---- probe-query: ad-hoc SQL ----
     p_pq = sub.add_parser(
         "probe-query",
@@ -7289,6 +7355,8 @@ def main():
         return _cmd_probe_mine(args)
     if args.cmd == "probe-query":
         return _cmd_probe_query(args)
+    if args.cmd == "probe-survey":
+        return _cmd_probe_survey(args)
     if args.cmd == "encode-fuzz":
         return _cmd_encode_fuzz(args)
     if args.cmd == "leaderboard":

@@ -145,6 +145,30 @@ RULES: list[Rule] = [
         """,
     ),
     Rule(
+        name="novel_sass_opcodes",
+        description=(
+            "Probes that emitted a SASS opcode no earlier probe had ever "
+            "produced.  Useful for sizing the 'mowable field' — when "
+            "successive sweeps stop returning novel rows, we've saturated "
+            "the encoding side of the surface for the current axes."
+        ),
+        sql="""
+            WITH first_seen AS (
+                SELECT target_opcode, MIN(probe_id) AS first_probe
+                FROM probes
+                WHERE target_opcode IS NOT NULL AND error IS NULL
+                GROUP BY target_opcode
+            )
+            SELECT p.probe_id,
+                   printf('0x%03x', p.target_opcode) AS opcode_hex,
+                   p.target_op, p.template_id
+            FROM probes p
+            JOIN first_seen fs
+              ON p.probe_id = fs.first_probe
+            ORDER BY p.probe_id
+        """,
+    ),
+    Rule(
         name="acc_alias_imm_classes_failing",
         description=(
             "From acc_self probes: which (opcode, imm_class) pairs produce "
