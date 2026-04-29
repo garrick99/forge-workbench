@@ -4870,6 +4870,23 @@ def _cmd_probe_watch(args):
         ts = time.strftime("%Y-%m-%dT%H:%M:%S")
         print(f"[probe-watch] cycle #{cycle} @ {ts}", flush=True)
 
+        # Optional pre-harvest hook — typically used to refresh a remote
+        # DB snapshot (e.g. WinRM-pull GreenDragon's live DB to a local
+        # file so probe-harvest-pair can join against it).  If the hook
+        # exits non-zero, we log it but still run the harvest.
+        if args.pre_cycle_cmd:
+            try:
+                pre = subprocess.run(args.pre_cycle_cmd, shell=True,
+                                     capture_output=True, text=True,
+                                     timeout=args.pre_cycle_timeout)
+                if pre.returncode != 0:
+                    print(f"  pre-cycle-cmd exited {pre.returncode}: "
+                          f"{(pre.stderr or pre.stdout or '').strip()[:200]}")
+                else:
+                    print(f"  pre-cycle-cmd ok")
+            except subprocess.TimeoutExpired:
+                print(f"  pre-cycle-cmd TIMEOUT after {args.pre_cycle_timeout}s")
+
         # Snapshot pre-harvest edge_id high water
         try:
             db = ProbeDB(str(Path(args.db_a).resolve()) if Path(args.db_a).resolve().is_dir()
@@ -8737,6 +8754,12 @@ def main():
                           help="path to the queue file new edges are appended "
                                "to (default: <db_a parent>/autofix_queue.txt)")
     p_pwatch.add_argument("--limit", type=int, default=30)
+    p_pwatch.add_argument("--pre-cycle-cmd", default=None,
+                          help="shell command to run before each harvest "
+                               "(typically: refresh a remote DB snapshot)")
+    p_pwatch.add_argument("--pre-cycle-timeout", type=int, default=180,
+                          help="seconds before aborting --pre-cycle-cmd "
+                               "(default: 180)")
 
     # ---- probe-autofix: generate a self-contained agent fix prompt ----
     p_paf = sub.add_parser(
