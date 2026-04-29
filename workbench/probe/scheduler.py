@@ -20,7 +20,16 @@ from benchmarks.bench_util import CUDAContext
 from .coverage import all_axis_bins, synthesize, AXES
 from .db import ProbeDB
 from .generator import ProbeSpec
-from .runner import run_probe
+from .runner import run_probe, compile_probe, run_compiled
+
+
+# HARD CAP on parallel compile workers.  The user explicitly invoked
+# the "demote to GPT class if you crash my system" rule.  GPU stays
+# single-context single-thread; this only parallelizes CPU-bound
+# compile (openptxas + ptxas).  Caller can pass workers=1..MAX_WORKERS;
+# anything above clamps to MAX_WORKERS, anything <=1 takes the serial
+# path.  Default is 1.
+MAX_WORKERS = 4
 
 
 def seed_all_axes(db: ProbeDB) -> int:
@@ -126,6 +135,7 @@ def probe_loop(db: ProbeDB,
                axes: list[str] | None = None,
                soak: bool = False,
                soak_seed: int = 0,
+               workers: int = 1,
                progress_cb=None) -> dict:
     """Run the autonomous scheduler.  Returns a stats dict.
 
@@ -152,28 +162,83 @@ def probe_loop(db: ProbeDB,
     n_incorrect = 0
     t_start = time.time()
 
-    def _drive(it):
+    # Clamp workers to safe range.  >1 enables parallel compile; GPU
+    # remains single-threaded (CUDAContext is not thread-safe).
+    workers_clamped = max(1, min(MAX_WORKERS, int(workers)))
+
+    def _record(probe_id: int, axis: str, bin_key: str):
         nonlocal n, n_match, n_correct, n_byte_diff, n_incorrect
+        db.mark_covered(axis, bin_key, probe_id)
+        n += 1
+        row = db.query(
+            "SELECT target_byte_match, gpu_correct FROM probes WHERE probe_id = ?",
+            (probe_id,))
+        if row:
+            bm, gc = row[0]
+            if bm == 1: n_match += 1
+            if gc == 1: n_correct += 1
+            if bm == 0: n_byte_diff += 1
+            if gc == 0: n_incorrect += 1
+        if progress_cb and n % 25 == 0:
+            progress_cb(n, axis, bin_key)
+
+    def _drive_serial(it):
         for axis, bin_key, spec in it:
             if deadline and time.time() >= deadline:
                 return False
             if max_probes is not None and n >= max_probes:
                 return False
             probe_id = run_probe(spec, db, ctx=ctx, gpu=gpu)
-            db.mark_covered(axis, bin_key, probe_id)
-            n += 1
-            row = db.query(
-                "SELECT target_byte_match, gpu_correct FROM probes WHERE probe_id = ?",
-                (probe_id,))
-            if row:
-                bm, gc = row[0]
-                if bm == 1: n_match += 1
-                if gc == 1: n_correct += 1
-                if bm == 0: n_byte_diff += 1
-                if gc == 0: n_incorrect += 1
-            if progress_cb and n % 25 == 0:
-                progress_cb(n, axis, bin_key)
+            _record(probe_id, axis, bin_key)
         return True
+
+    def _drive_parallel(it):
+        """Compile in a thread pool, run+insert serially on the GPU.
+        GPU is touched only on the main thread.  DB writes are serial
+        through SQLite WAL.  No multi-process, no multi-context."""
+        from concurrent.futures import ThreadPoolExecutor
+        # Chunk size balances pool fill vs deadline responsiveness.
+        # Each chunk: pre-compile up to `workers_clamped * 4` specs in
+        # parallel, then drain on GPU before pulling the next chunk.
+        chunk = workers_clamped * 4
+        pool = ThreadPoolExecutor(max_workers=workers_clamped)
+        try:
+            batch: list = []
+            for axis, bin_key, spec in it:
+                if deadline and time.time() >= deadline:
+                    return False
+                if max_probes is not None and n >= max_probes:
+                    return False
+                batch.append((axis, bin_key, spec))
+                if len(batch) >= chunk:
+                    futures = [(a, b, pool.submit(compile_probe, s))
+                               for (a, b, s) in batch]
+                    for a, b, fut in futures:
+                        if deadline and time.time() >= deadline:
+                            return False
+                        if max_probes is not None and n >= max_probes:
+                            return False
+                        compiled = fut.result()
+                        probe_id = run_compiled(compiled, db, ctx=ctx, gpu=gpu)
+                        _record(probe_id, a, b)
+                    batch = []
+            # Drain remaining
+            if batch:
+                futures = [(a, b, pool.submit(compile_probe, s))
+                           for (a, b, s) in batch]
+                for a, b, fut in futures:
+                    if deadline and time.time() >= deadline:
+                        return False
+                    if max_probes is not None and n >= max_probes:
+                        return False
+                    compiled = fut.result()
+                    probe_id = run_compiled(compiled, db, ctx=ctx, gpu=gpu)
+                    _record(probe_id, a, b)
+        finally:
+            pool.shutdown(wait=True)
+        return True
+
+    _drive = _drive_parallel if workers_clamped > 1 else _drive_serial
 
     try:
         # First fill all unfilled bins (coverage_greedy).

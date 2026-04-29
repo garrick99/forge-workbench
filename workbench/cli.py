@@ -4795,6 +4795,7 @@ def _cmd_probe_loop(args):
         axes=axes,
         soak=args.soak,
         soak_seed=args.soak_seed,
+        workers=args.workers,
         progress_cb=progress,
     )
     print()
@@ -7399,6 +7400,12 @@ def main():
                            "you stop it.")
     p_pl.add_argument("--soak-seed", type=int, default=0,
                       help="RNG seed for soak mode (default: 0)")
+    p_pl.add_argument("--workers", type=int, default=1,
+                      help="Parallel compile workers (default: 1, max: 4). "
+                           "GPU remains single-context single-stream — only "
+                           "compile (CPU-bound) is parallelized.  Values >4 "
+                           "are clamped.  Default 1 keeps behavior identical "
+                           "to pre-multicore mower.")
 
     # ---- probe-stats: print DB summary ----
     p_ps = sub.add_parser(

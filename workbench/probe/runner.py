@@ -260,6 +260,117 @@ def _check_correct(out: bytes, spec: ProbeSpec) -> bool | None:
 
 
 # ---------------------------------------------------------------------------
+# Compile-only step (CPU-bound, thread-safe, no GPU).
+# Used by parallel pipelines: compile-then-run.
+# ---------------------------------------------------------------------------
+
+def compile_probe(spec: ProbeSpec) -> dict:
+    """CPU-only compile of a probe.  Returns a dict with all info needed
+    by run_compiled to launch on the GPU and record to the DB.
+
+    Thread-safe: no shared mutable state.  Each call creates its own
+    cubin bytes; nothing touches the DB or the CUDA driver.
+
+    On compile error, the result dict has 'error' set; run_compiled will
+    insert a no-cubin row.
+    """
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+    ptx = materialize(spec)
+    out = {
+        "spec": spec, "ts": ts, "ptx": ptx,
+        "ours_cubin": None, "ptxas_cubin": None,
+        "ours_compile_ms": None, "ptxas_compile_ms": None,
+        "error": None,
+    }
+    try:
+        t0 = time.perf_counter()
+        ours_cubin, _ = compile_openptxas(ptx)
+        out["ours_compile_ms"] = (time.perf_counter() - t0) * 1000
+        out["ours_cubin"] = ours_cubin
+    except Exception as e:
+        out["error"] = f"openptxas-compile: {type(e).__name__}: {e}"
+        return out
+    try:
+        t0 = time.perf_counter()
+        ptxas_cubin, _ = compile_ptxas(ptx)
+        out["ptxas_compile_ms"] = (time.perf_counter() - t0) * 1000
+        out["ptxas_cubin"] = ptxas_cubin
+    except Exception as e:
+        out["error"] = f"ptxas-compile: {type(e).__name__}: {e}"
+    return out
+
+
+def run_compiled(compiled: dict, db: ProbeDB,
+                 ctx: Optional[CUDAContext] = None,
+                 gpu: bool = True,
+                 ptxas_version: str = "",
+                 git_openptxas: str = "",
+                 sm_version: str = "120") -> int:
+    """Single-threaded GPU-launch + DB-insert step.  Caller MUST run
+    this serially — the CUDAContext is not thread-safe."""
+    spec = compiled["spec"]
+    row = {
+        "ts": compiled["ts"],
+        "template_id": spec.template_id,
+        "target_op": spec.target_op,
+        "operand_spec": _to_json(spec.operand_spec),
+        "pre_context_json": _to_json(spec.pre_context),
+        "post_context_json": _to_json(spec.post_context),
+        "ptx_sha": db.put_ptx(compiled["ptx"]),
+        "git_openptxas": git_openptxas,
+        "ptxas_version": ptxas_version,
+        "sm_version": sm_version,
+        "runner_host": socket.gethostname(),
+    }
+    if compiled["ours_compile_ms"] is not None:
+        row["ours_compile_ms"] = compiled["ours_compile_ms"]
+    if compiled["ours_cubin"] is not None:
+        row["ours_cubin_sha"] = db.put_cubin(compiled["ours_cubin"])
+    if compiled["ptxas_compile_ms"] is not None:
+        row["ptxas_compile_ms"] = compiled["ptxas_compile_ms"]
+    if compiled["ptxas_cubin"] is not None:
+        row["ptxas_cubin_sha"] = db.put_cubin(compiled["ptxas_cubin"])
+    if compiled["error"]:
+        row["error"] = compiled["error"]
+        return db.insert_probe(row)
+
+    ours_cubin  = compiled["ours_cubin"]
+    ptxas_cubin = compiled["ptxas_cubin"]
+    ours_text   = _extract_text_section(ours_cubin, "probe") or b""
+    ptxas_text  = _extract_text_section(ptxas_cubin, "probe") or b""
+    o_hit = _find_target(ours_text, spec.target_op)
+    p_hit = _find_target(ptxas_text, spec.target_op)
+    if o_hit and p_hit:
+        row["target_ours_raw"]  = o_hit[1]
+        row["target_ptxas_raw"] = p_hit[1]
+        row["target_byte_match"] = 1 if o_hit[1] == p_hit[1] else 0
+        row["target_opcode"] = _decode_opcode(o_hit[1])
+        oc = _decode_ctrl(o_hit[1])
+        pc = _decode_ctrl(p_hit[1])
+        row["ours_wdep"]  = oc["wdep"]
+        row["ours_rbar"]  = oc["rbar"]
+        row["ptxas_wdep"] = pc["wdep"]
+        row["ptxas_rbar"] = pc["rbar"]
+
+    if gpu and ctx is not None:
+        extra = spec.template_id in ("load_consume",)
+        ours_out = _run_cubin(ctx, ours_cubin, extra_buf=extra)
+        ptxas_out = _run_cubin(ctx, ptxas_cubin, extra_buf=extra)
+        if ours_out is not None and ptxas_out is not None:
+            ours_vs_oracle = ours_out == ptxas_out
+            ours_vs_expected = _check_correct(ours_out, spec)
+            if ours_vs_expected is None:
+                row["gpu_correct"] = 1 if ours_vs_oracle else 0
+            else:
+                row["gpu_correct"] = 1 if (ours_vs_expected and ours_vs_oracle) else 0
+        elif ours_out is None:
+            row["gpu_correct"] = 0
+            row["error"] = (row.get("error") or "") + " gpu-launch:ours-failed"
+
+    return db.insert_probe(row)
+
+
+# ---------------------------------------------------------------------------
 # Public entry: run a single probe end-to-end and store the result.
 # ---------------------------------------------------------------------------
 
