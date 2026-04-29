@@ -331,6 +331,102 @@ def encoder_audit(db: ProbeDB) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Encoder-walk classification — group the uncovered encoders into named
+# territories so we have a concrete roadmap to close the gap.  Each
+# entry maps a name-prefix or pattern to a (territory, hint) tuple.
+# ---------------------------------------------------------------------------
+
+_ENCODER_TERRITORIES = [
+    # (matcher_fn, territory, hint)
+    (lambda n: n.startswith("encode_hmma"), "tensor.HMMA",
+     "f16/bf16/tf32 matrix-multiply-accumulate; needs warp-level template"),
+    (lambda n: n.startswith("encode_imma"), "tensor.IMMA",
+     "integer matrix-multiply-accumulate; warp template"),
+    (lambda n: n.startswith("encode_qmma"), "tensor.QMMA",
+     "fp8 (e4m3/e5m2) matrix-multiply; warp template"),
+    (lambda n: n.startswith("encode_dmma"), "tensor.DMMA",
+     "fp64 matrix-multiply; warp template"),
+    (lambda n: n.startswith("encode_redux"), "warp.REDUX",
+     "warp-wide reduction; needs sync template"),
+    (lambda n: n.startswith("encode_vote"), "warp.VOTE",
+     "vote.all/any/ballot.sync; warp predicate template"),
+    (lambda n: n.startswith("encode_match"), "warp.MATCH",
+     "match.all/any.sync; warp lane-match template"),
+    (lambda n: n.startswith("encode_atomg_cas"), "atomic.CAS",
+     "atomic compare-and-swap; needs contention template"),
+    (lambda n: n.startswith("encode_d") and n.split("_")[1] in
+        {"add", "mul", "fma", "setp"}, "f64.ALU",
+     "f64 ALU op; needs FpImmOp + .f64 register set"),
+    (lambda n: n.startswith("encode_utma") or n.startswith("encode_ublk"),
+     "TMA.async",
+     "tensor memory accelerator; needs cluster + async template"),
+    (lambda n: n.startswith("encode_mufu"), "MUFU",
+     "transcendentals (sin/cos/sqrt/rcp/rsqrt/ex2/lg2); single-src template"),
+    (lambda n: n.startswith("encode_fsel"), "selp.FSEL",
+     "float select variants; FP literal template"),
+    (lambda n: n.startswith("encode_imnmx") or n.startswith("encode_vimnmx"),
+     "int.minmax",
+     "integer min/max variants; reg-reg + reg-imm"),
+    (lambda n: n.startswith("encode_lea") or n.startswith("encode_ulea"),
+     "LEA",
+     "load-effective-address; address-formation template"),
+    (lambda n: n.startswith("encode_bmsk"), "BMSK",
+     "bit-mask construction; bit-fiddle template"),
+    (lambda n: n.startswith("encode_plop3"), "PLOP3",
+     "predicate LOP3; predicate-arithmetic template"),
+    (lambda n: n.startswith("encode_idp4a"), "DP4A",
+     "4-way dot-product; integer DP template"),
+    (lambda n: n.startswith("encode_isetp") or n.startswith("encode_uisetp"),
+     "setp.int",
+     "integer setp variants we don't yet emit"),
+    (lambda n: n.startswith("encode_fsetp"), "setp.float",
+     "float setp variants"),
+    (lambda n: n.startswith("encode_dsetp"), "setp.f64",
+     "double setp"),
+    (lambda n: n.startswith("encode_cvt") or n.startswith("encode_i2f")
+        or n.startswith("encode_f2i") or n.startswith("encode_f2f")
+        or n.startswith("encode_f2fp") or n.startswith("encode_i2ip"),
+     "cvt.misc",
+     "uncommon conversion variants"),
+    (lambda n: n.startswith("encode_syncs") or n.startswith("encode_cgaerr"),
+     "cluster.sync",
+     "thread-block-cluster synchronization (Hopper+)"),
+    (lambda n: n.startswith("encode_p2r") or n.startswith("encode_r2p")
+        or n.startswith("encode_b2r"),
+     "predicate.transfer",
+     "predicate↔GPR data movement"),
+    (lambda n: n.startswith("encode_cs2r") or n.startswith("encode_pmtrig"),
+     "system",
+     "system-register reads / perf trigger"),
+    (lambda n: n.startswith("encode_bra"), "branch",
+     "branch variants (BRA.U etc.)"),
+    (lambda n: n.startswith("encode_ldsm"), "ldmatrix",
+     "shared→tensor-core matrix load"),
+    (lambda n: n.startswith("encode_sts"), "store.shared",
+     "shared memory store variants"),
+]
+
+
+def classify_encoders(uncovered: list[tuple[str, int]]) -> dict:
+    """Group the uncovered encoder list into named territories."""
+    by_terr: dict[str, dict] = {}
+    for name, opc in uncovered:
+        terr = "misc"
+        hint = ""
+        for matcher, label, h in _ENCODER_TERRITORIES:
+            try:
+                if matcher(name):
+                    terr = label
+                    hint = h
+                    break
+            except Exception:
+                continue
+        by_terr.setdefault(terr, {"hint": hint, "encoders": []})
+        by_terr[terr]["encoders"].append((name, opc))
+    return by_terr
+
+
+# ---------------------------------------------------------------------------
 # Top-level survey — used by the `probe-survey` CLI command
 # ---------------------------------------------------------------------------
 

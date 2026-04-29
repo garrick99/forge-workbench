@@ -5342,6 +5342,19 @@ def _cmd_probe_encoder_audit(args):
         if len(rep["errored"]) > 30:
             print(f"    ... +{len(rep['errored']) - 30} more")
 
+    if args.classify:
+        from workbench.probe.surface import classify_encoders
+        cls = classify_encoders(rep["uncovered"])
+        print()
+        print("  --- UNCOVERED ENCODERS BY TERRITORY ---")
+        for terr in sorted(cls.keys(), key=lambda t: -len(cls[t]["encoders"])):
+            info = cls[terr]
+            print(f"  • {terr}  ({len(info['encoders'])} encoders)")
+            print(f"      {info['hint']}")
+            ops = sorted({opc for _, opc in info["encoders"]})
+            print(f"      opcodes: {', '.join(f'0x{o:03x}' for o in ops)}")
+            print()
+
     db.close()
     return 0
 
@@ -7914,6 +7927,9 @@ def main():
     p_pea.add_argument("--show", default="uncovered",
                        choices=["uncovered", "covered", "errored", "all"],
                        help="which group to list (default: uncovered)")
+    p_pea.add_argument("--classify", action="store_true",
+                       help="group uncovered encoders by named territory "
+                            "(tensor.HMMA, warp.REDUX, atomic.CAS, etc.)")
 
     # ---- probe-determinism: re-run probes for variance ----
     p_pd = sub.add_parser(
