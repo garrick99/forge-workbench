@@ -576,22 +576,475 @@ def template_fma_op(spec: ProbeSpec) -> str:
 """
 
 
+# ---------------------------------------------------------------------------
+# Template: branch_distance
+#   bra to a label N instructions away.  Probes branch-target encoding
+#   (BRA imm field) at varying distances.  All threads take the branch
+#   (uniform), so divergence is not a factor here.
+#
+#   operand_spec keys:
+#     gap : number of filler instructions between bra and target label
+# ---------------------------------------------------------------------------
+
+def template_branch_distance(spec: ProbeSpec) -> str:
+    gap = spec.operand_spec.get("gap", 0)
+    # Filler ops modify %r3, never touch %r2.
+    fillers = "\n    ".join(["add.u32 %r3, %r3, 1;"] * gap)
+    return f""".version 9.0
+.target sm_120
+.address_size 64
+.visible .entry probe(.param .u64 p_out, .param .u32 n) {{
+    .reg .u32 %r<8>; .reg .u64 %rd<3>; .reg .pred %p0;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    mov.u32 %r2, 0xDEAD;
+    mov.u32 %r3, 0;
+    bra L_target;
+    mov.u32 %r2, 0xBAD0;       // unreachable; if hit, output is wrong
+    {fillers}
+L_target:
+    add.u32 %r2, %r2, 1;       // 0xDEAE if branch taken correctly
+    cvt.u64.u32 %rd1, %r0; shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r2;
+    ret;
+}}
+"""
+
+
+def expected_branch_distance(spec: ProbeSpec, tid: int) -> int:
+    return 0xDEAE
+
+
+# ---------------------------------------------------------------------------
+# Template: loop_iter
+#   Counted loop running N iterations.  Tests back-branch encoding,
+#   loop-counter decrement chain, and predicate-based exit.
+#
+#   operand_spec keys:
+#     iters : iteration count (uniform across all threads)
+# ---------------------------------------------------------------------------
+
+def template_loop_iter(spec: ProbeSpec) -> str:
+    iters = spec.operand_spec.get("iters", 4)
+    return f""".version 9.0
+.target sm_120
+.address_size 64
+.visible .entry probe(.param .u64 p_out, .param .u32 n) {{
+    .reg .u32 %r<8>; .reg .u64 %rd<3>; .reg .pred %p0, %p1;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    mov.u32 %r2, 0;
+    mov.u32 %r3, {iters};
+L_loop:
+    add.u32 %r2, %r2, 1;
+    sub.u32 %r3, %r3, 1;
+    setp.ne.u32 %p1, %r3, 0;
+    @%p1 bra L_loop;
+    cvt.u64.u32 %rd1, %r0; shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r2;
+    ret;
+}}
+"""
+
+
+def expected_loop_iter(spec: ProbeSpec, tid: int) -> int:
+    return spec.operand_spec.get("iters", 4) & 0xFFFFFFFF
+
+
+# ---------------------------------------------------------------------------
+# Template: divergent_branch
+#   Half of threads take one path, half take another.  Each path writes
+#   a distinct value to %r2.  Tests divergence handling (BSSY/BSYNC /
+#   reconvergence stack) and ensures the warp-level scheduler is correct.
+#
+#   operand_spec keys:
+#     thr     : tid threshold for setp.lt (default 32)
+#     a_val   : value if predicate true
+#     b_val   : value if predicate false
+# ---------------------------------------------------------------------------
+
+def template_divergent_branch(spec: ProbeSpec) -> str:
+    thr = spec.operand_spec.get("thr", 32)
+    a_val = spec.operand_spec.get("a_val", 0xAAAA)
+    b_val = spec.operand_spec.get("b_val", 0x5555)
+    return f""".version 9.0
+.target sm_120
+.address_size 64
+.visible .entry probe(.param .u64 p_out, .param .u32 n) {{
+    .reg .u32 %r<8>; .reg .u64 %rd<3>; .reg .pred %p0, %p1;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    mov.u32 %r2, 0;
+    setp.lt.u32 %p1, %r0, {thr};
+    @%p1 bra L_taken;
+    mov.u32 %r2, {b_val};
+    bra L_join;
+L_taken:
+    mov.u32 %r2, {a_val};
+L_join:
+    add.u32 %r2, %r2, 1;       // both sides converge here
+    cvt.u64.u32 %rd1, %r0; shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r2;
+    ret;
+}}
+"""
+
+
+def expected_divergent_branch(spec: ProbeSpec, tid: int) -> int:
+    thr = spec.operand_spec.get("thr", 32)
+    a_val = spec.operand_spec.get("a_val", 0xAAAA)
+    b_val = spec.operand_spec.get("b_val", 0x5555)
+    base = a_val if tid < thr else b_val
+    return (base + 1) & 0xFFFFFFFF
+
+
+# ---------------------------------------------------------------------------
+# Template: pred_composition
+#   Compose two predicates with and.pred / or.pred / xor.pred, then use
+#   the result to conditionally execute.  Probes PSETP encoding and
+#   predicate-register tracking.
+#
+#   operand_spec keys:
+#     compose : 'and' | 'or' | 'xor'
+#     thr_a   : threshold for first setp.lt
+#     thr_b   : threshold for second setp.gt
+# ---------------------------------------------------------------------------
+
+def template_pred_composition(spec: ProbeSpec) -> str:
+    compose = spec.operand_spec.get("compose", "and")
+    thr_a = spec.operand_spec.get("thr_a", 64)
+    thr_b = spec.operand_spec.get("thr_b", 16)
+    return f""".version 9.0
+.target sm_120
+.address_size 64
+.visible .entry probe(.param .u64 p_out, .param .u32 n) {{
+    .reg .u32 %r<8>; .reg .u64 %rd<3>; .reg .pred %p0, %p1, %p2, %p3;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    mov.u32 %r2, 0;
+    setp.lt.u32 %p1, %r0, {thr_a};
+    setp.gt.u32 %p2, %r0, {thr_b};
+    {compose}.pred %p3, %p1, %p2;
+    @%p3 mov.u32 %r2, 0xCAFE;
+    cvt.u64.u32 %rd1, %r0; shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r2;
+    ret;
+}}
+"""
+
+
+def expected_pred_composition(spec: ProbeSpec, tid: int) -> int:
+    compose = spec.operand_spec.get("compose", "and")
+    thr_a = spec.operand_spec.get("thr_a", 64)
+    thr_b = spec.operand_spec.get("thr_b", 16)
+    p1 = tid < thr_a
+    p2 = tid > thr_b
+    if compose == "and":
+        p3 = p1 and p2
+    elif compose == "or":
+        p3 = p1 or p2
+    elif compose == "xor":
+        p3 = p1 != p2
+    else:
+        return None
+    return 0xCAFE if p3 else 0
+
+
+# ---------------------------------------------------------------------------
+# Template: shared_barrier
+#   Each thread writes its tid to shared[tid], barrier, then reads
+#   shared[(tid+offset) % blockDim].  Probes ld.shared / st.shared
+#   encoding, bar.sync, and shared-memory address arithmetic.
+#
+#   The expected output for thread tid is (tid + offset) % blockDim.
+#   We use blockDim known via param `n` — but easier: assume blockDim
+#   == 128 and clamp via &.
+#
+#   operand_spec keys:
+#     offset : neighbor offset to read (default 1)
+# ---------------------------------------------------------------------------
+
+def template_shared_barrier(spec: ProbeSpec) -> str:
+    offset = spec.operand_spec.get("offset", 1) & 0x7F  # mask to [0,127]
+    # Static shared allocation: 128 u32 slots = 512 bytes.  Avoids the
+    # need for the launcher to pass dynamic shared-mem bytes.
+    return f""".version 9.0
+.target sm_120
+.address_size 64
+.shared .align 4 .b8 buf[512];
+.visible .entry probe(.param .u64 p_out, .param .u32 n) {{
+    .reg .u32 %r<8>; .reg .u64 %rd<5>; .reg .pred %p0;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    // st.shared.u32 [&buf[tid*4]], tid
+    mov.u64 %rd1, buf;
+    cvt.u64.u32 %rd2, %r0;
+    shl.b64 %rd2, %rd2, 2;
+    add.u64 %rd3, %rd1, %rd2;
+    st.shared.u32 [%rd3], %r0;
+    bar.sync 0;
+    // read shared[(tid + offset) & 0x7F]
+    add.u32 %r3, %r0, {offset};
+    and.b32 %r3, %r3, 0x7F;
+    cvt.u64.u32 %rd4, %r3;
+    shl.b64 %rd4, %rd4, 2;
+    add.u64 %rd3, %rd1, %rd4;
+    ld.shared.u32 %r2, [%rd3];
+    bar.sync 0;
+    cvt.u64.u32 %rd2, %r0; shl.b64 %rd2, %rd2, 2;
+    add.u64 %rd3, %rd0, %rd2;
+    st.global.u32 [%rd3], %r2;
+    ret;
+}}
+"""
+
+
+def expected_shared_barrier(spec: ProbeSpec, tid: int) -> int:
+    offset = spec.operand_spec.get("offset", 1) & 0x7F
+    return (tid + offset) & 0x7F
+
+
+# ---------------------------------------------------------------------------
+# Template: hmma_m16n8k16
+#   Tensor-core mma.sync at m16n8k16 with f16 inputs and f32 accumulator.
+#   This is a one-warp probe — n must be exactly 32.
+#
+#   We pick A = identity-shape (a[i][j] = 1.0 iff i==j on the k-axis),
+#   B = identity-shape, C = 0, so D should equal A * B = identity-block.
+#   This gives a known-output oracle without depending on ptxas.
+#
+#   For SM_120 m16n8k16 row/col layout (PTX ISA 8.x doc):
+#     - Each thread provides 4 .b32 a-fragments (each holds 2 f16s)
+#     - Each thread provides 2 .b32 b-fragments
+#     - Each thread provides 4 .f32 c-fragments
+#     - Each thread receives 4 .f32 d-fragments
+#
+#   To keep things simple, we use init_ones=True: every fragment piece
+#   is 1.0 (in f16: 0x3C00).  For a 16x16 (A) * 16x8 (B) matmul where
+#   all entries are 1.0, every output entry = 16.0.  Trivial oracle.
+#
+#   operand_spec keys: (none — fixed shape)
+# ---------------------------------------------------------------------------
+
+def template_hmma_m16n8k16(spec: ProbeSpec) -> str:
+    # mma.sync requires all 32 lanes of a warp to be active.  The runner
+    # launches N_THREADS=128 (4 warps); all warps perform an independent
+    # mma with the same all-ones inputs, so every thread sees a 16.0
+    # output element.  Each thread writes ONE u32 (=bit-pattern of d0)
+    # to out[tid] — fitting the standard 4-bytes-per-tid layout.
+    return f""".version 9.0
+.target sm_120
+.address_size 64
+.visible .entry probe(.param .u64 p_out, .param .u32 n) {{
+    .reg .u32 %r<8>; .reg .u64 %rd<3>; .reg .pred %p0;
+    .reg .b32 %a<4>;            // A fragment: 4 .b32 each = 2 f16
+    .reg .b32 %b<2>;            // B fragment: 2 .b32 each = 2 f16
+    .reg .f32 %c<4>;            // C accumulator
+    .reg .f32 %d<4>;            // D output
+
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+
+    // 1.0 as f16 = 0x3C00; packed (1.0, 1.0) = 0x3C003C00
+    mov.b32 %a0, 0x3C003C00;
+    mov.b32 %a1, 0x3C003C00;
+    mov.b32 %a2, 0x3C003C00;
+    mov.b32 %a3, 0x3C003C00;
+    mov.b32 %b0, 0x3C003C00;
+    mov.b32 %b1, 0x3C003C00;
+    mov.f32 %c0, 0f00000000;
+    mov.f32 %c1, 0f00000000;
+    mov.f32 %c2, 0f00000000;
+    mov.f32 %c3, 0f00000000;
+
+    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+        {{ %d0, %d1, %d2, %d3 }},
+        {{ %a0, %a1, %a2, %a3 }},
+        {{ %b0, %b1 }},
+        {{ %c0, %c1, %c2, %c3 }};
+
+    mov.b32 %r2, %d0;
+    cvt.u64.u32 %rd1, %r0; shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r2;
+    ret;
+}}
+"""
+
+
+def expected_hmma_m16n8k16(spec: ProbeSpec, tid: int) -> int:
+    """Each thread writes 4 f32 outputs.  When A=all-1.0(f16), B=all-1.0(f16),
+    C=0, every entry of D is 16.0 (sum of 16 products of 1.0*1.0).
+
+    This expected_output returns the bit-pattern of one f32 slot — we
+    use slot 0.  The HMMA template's runner-side check should compare
+    all four 4-byte slots per thread; for now we use slot 0 = 16.0 as
+    a simple oracle marker.
+    """
+    # f32 16.0 = 0x41800000
+    return 0x41800000
+
+
+# ---------------------------------------------------------------------------
+# Template: hmma_m16n8k8
+#   Smaller k=8 variant of HMMA (FP16 inputs, FP32 accumulator).
+#     A: 2 .b32 (4 f16)
+#     B: 1 .b32 (2 f16)
+#     C/D: 4 f32
+#
+#   With A=B=all-1.0(f16), C=0, every D entry = 8.0 = 0x41000000.
+# ---------------------------------------------------------------------------
+
+def template_hmma_m16n8k8(spec: ProbeSpec) -> str:
+    return f""".version 9.0
+.target sm_120
+.address_size 64
+.visible .entry probe(.param .u64 p_out, .param .u32 n) {{
+    .reg .u32 %r<8>; .reg .u64 %rd<3>; .reg .pred %p0;
+    .reg .b32 %a<2>; .reg .b32 %b<1>;
+    .reg .f32 %c<4>; .reg .f32 %d<4>;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    mov.b32 %a0, 0x3C003C00; mov.b32 %a1, 0x3C003C00;
+    mov.b32 %b0, 0x3C003C00;
+    mov.f32 %c0, 0f00000000; mov.f32 %c1, 0f00000000;
+    mov.f32 %c2, 0f00000000; mov.f32 %c3, 0f00000000;
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {{ %d0, %d1, %d2, %d3 }},
+        {{ %a0, %a1 }},
+        {{ %b0 }},
+        {{ %c0, %c1, %c2, %c3 }};
+    mov.b32 %r2, %d0;
+    cvt.u64.u32 %rd1, %r0; shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r2;
+    ret;
+}}
+"""
+
+
+def expected_hmma_m16n8k8(spec: ProbeSpec, tid: int) -> int:
+    return 0x41000000  # f32 8.0
+
+
+# ---------------------------------------------------------------------------
+# Template: hmma_bf16_m16n8k16
+#   bf16 inputs (1.0 = 0x3F80), f32 accumulator.  Same shape as f16
+#   m16n8k16, expected D = 16.0.
+# ---------------------------------------------------------------------------
+
+def template_hmma_bf16_m16n8k16(spec: ProbeSpec) -> str:
+    return f""".version 9.0
+.target sm_120
+.address_size 64
+.visible .entry probe(.param .u64 p_out, .param .u32 n) {{
+    .reg .u32 %r<8>; .reg .u64 %rd<3>; .reg .pred %p0;
+    .reg .b32 %a<4>; .reg .b32 %b<2>;
+    .reg .f32 %c<4>; .reg .f32 %d<4>;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    // bf16 1.0 = 0x3F80; packed (1.0,1.0) = 0x3F803F80
+    mov.b32 %a0, 0x3F803F80; mov.b32 %a1, 0x3F803F80;
+    mov.b32 %a2, 0x3F803F80; mov.b32 %a3, 0x3F803F80;
+    mov.b32 %b0, 0x3F803F80; mov.b32 %b1, 0x3F803F80;
+    mov.f32 %c0, 0f00000000; mov.f32 %c1, 0f00000000;
+    mov.f32 %c2, 0f00000000; mov.f32 %c3, 0f00000000;
+    mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32
+        {{ %d0, %d1, %d2, %d3 }},
+        {{ %a0, %a1, %a2, %a3 }},
+        {{ %b0, %b1 }},
+        {{ %c0, %c1, %c2, %c3 }};
+    mov.b32 %r2, %d0;
+    cvt.u64.u32 %rd1, %r0; shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r2;
+    ret;
+}}
+"""
+
+
+def expected_hmma_bf16_m16n8k16(spec: ProbeSpec, tid: int) -> int:
+    return 0x41800000  # f32 16.0
+
+
+# ---------------------------------------------------------------------------
+# Template: hmma_tf32_m16n8k8
+#   tf32 m16n8k8: A 4 .b32 (4 tf32), B 2 .b32 (2 tf32), C/D 4 f32.
+#   tf32 1.0 = 0x3F800000 (f32 representation, top 19 bits used).
+#   With A=B=1.0, C=0: D = 8.0.
+# ---------------------------------------------------------------------------
+
+def template_hmma_tf32_m16n8k8(spec: ProbeSpec) -> str:
+    return f""".version 9.0
+.target sm_120
+.address_size 64
+.visible .entry probe(.param .u64 p_out, .param .u32 n) {{
+    .reg .u32 %r<8>; .reg .u64 %rd<3>; .reg .pred %p0;
+    .reg .b32 %a<4>; .reg .b32 %b<2>;
+    .reg .f32 %c<4>; .reg .f32 %d<4>;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    mov.b32 %a0, 0x3F800000; mov.b32 %a1, 0x3F800000;
+    mov.b32 %a2, 0x3F800000; mov.b32 %a3, 0x3F800000;
+    mov.b32 %b0, 0x3F800000; mov.b32 %b1, 0x3F800000;
+    mov.f32 %c0, 0f00000000; mov.f32 %c1, 0f00000000;
+    mov.f32 %c2, 0f00000000; mov.f32 %c3, 0f00000000;
+    mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32
+        {{ %d0, %d1, %d2, %d3 }},
+        {{ %a0, %a1, %a2, %a3 }},
+        {{ %b0, %b1 }},
+        {{ %c0, %c1, %c2, %c3 }};
+    mov.b32 %r2, %d0;
+    cvt.u64.u32 %rd1, %r0; shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r2;
+    ret;
+}}
+"""
+
+
+def expected_hmma_tf32_m16n8k8(spec: ProbeSpec, tid: int) -> int:
+    return 0x41000000  # f32 8.0
+
+
 TEMPLATES: dict[str, tuple[Callable[[ProbeSpec], str],
                            Callable[[ProbeSpec, int], int | None] | None]] = {
-    "alu_single":      (template_alu_single,      None),
-    "alu_acc_self":    (template_alu_acc_self,    expected_alu_acc_self),
-    "pair_distance":   (template_pair_distance,   None),
-    "latency_sweep":   (template_latency_sweep,   expected_latency_sweep),
-    "alu_64bit":       (template_alu_64bit,       None),
-    "load_consume":    (template_load_consume,    None),
-    "predicated_alu":  (template_predicated_alu,  None),
-    "atomic_op":       (template_atomic_op,       None),
-    "alu_f32":         (template_alu_f32,         None),
-    "cvt_op":          (template_cvt_op,          None),
-    "alu_unary":       (template_alu_unary,       None),
-    "bitfield":        (template_bitfield,        None),
-    "selp_op":         (template_selp_op,         None),
-    "fma_op":          (template_fma_op,          None),
+    "alu_single":         (template_alu_single,         None),
+    "alu_acc_self":       (template_alu_acc_self,       expected_alu_acc_self),
+    "pair_distance":      (template_pair_distance,      None),
+    "latency_sweep":      (template_latency_sweep,      expected_latency_sweep),
+    "alu_64bit":          (template_alu_64bit,          None),
+    "load_consume":       (template_load_consume,       None),
+    "predicated_alu":     (template_predicated_alu,     None),
+    "atomic_op":          (template_atomic_op,          None),
+    "alu_f32":            (template_alu_f32,            None),
+    "cvt_op":             (template_cvt_op,             None),
+    "alu_unary":          (template_alu_unary,          None),
+    "bitfield":           (template_bitfield,           None),
+    "selp_op":            (template_selp_op,            None),
+    "fma_op":             (template_fma_op,             None),
+    "branch_distance":    (template_branch_distance,    expected_branch_distance),
+    "loop_iter":          (template_loop_iter,          expected_loop_iter),
+    "divergent_branch":   (template_divergent_branch,   expected_divergent_branch),
+    "pred_composition":   (template_pred_composition,   expected_pred_composition),
+    "shared_barrier":     (template_shared_barrier,     expected_shared_barrier),
+    "hmma_m16n8k16":      (template_hmma_m16n8k16,      expected_hmma_m16n8k16),
+    "hmma_m16n8k8":       (template_hmma_m16n8k8,       expected_hmma_m16n8k8),
+    "hmma_bf16_m16n8k16": (template_hmma_bf16_m16n8k16, expected_hmma_bf16_m16n8k16),
+    "hmma_tf32_m16n8k8":  (template_hmma_tf32_m16n8k8,  expected_hmma_tf32_m16n8k8),
 }
 
 

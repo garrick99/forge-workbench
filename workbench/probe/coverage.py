@@ -862,6 +862,187 @@ def synthesize_regression(bin_key: str) -> ProbeSpec | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Axis 16: branch_distance — bra over varying instruction gaps.
+# ---------------------------------------------------------------------------
+
+_BRA_GAPS = [0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
+
+
+def axis_branch_distance_bins() -> list[str]:
+    return [f"gap={g}" for g in _BRA_GAPS]
+
+
+def synthesize_branch_distance(bin_key: str) -> ProbeSpec | None:
+    if not bin_key.startswith("gap="):
+        return None
+    try:
+        gap = int(bin_key[4:])
+    except ValueError:
+        return None
+    return ProbeSpec(
+        template_id="branch_distance",
+        target_op="bra",
+        operand_spec={"gap": gap},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Axis 17: loop_iter — counted loops at varying iteration counts.
+# ---------------------------------------------------------------------------
+
+_LOOP_ITERS = [1, 2, 3, 4, 5, 7, 8, 15, 16, 31, 32, 63, 64, 100, 255, 256]
+
+
+def axis_loop_iter_bins() -> list[str]:
+    return [f"iters={n}" for n in _LOOP_ITERS]
+
+
+def synthesize_loop_iter(bin_key: str) -> ProbeSpec | None:
+    if not bin_key.startswith("iters="):
+        return None
+    try:
+        iters = int(bin_key[6:])
+    except ValueError:
+        return None
+    return ProbeSpec(
+        template_id="loop_iter",
+        target_op="loop",
+        operand_spec={"iters": iters},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Axis 18: divergent_branch — split warp at varying tid thresholds.
+# ---------------------------------------------------------------------------
+
+_DIV_THRS = [1, 2, 4, 8, 16, 17, 31, 32, 33, 48, 63, 64, 96, 127]
+
+
+def axis_divergent_branch_bins() -> list[str]:
+    return [f"thr={t}" for t in _DIV_THRS]
+
+
+def synthesize_divergent_branch(bin_key: str) -> ProbeSpec | None:
+    if not bin_key.startswith("thr="):
+        return None
+    try:
+        thr = int(bin_key[4:])
+    except ValueError:
+        return None
+    return ProbeSpec(
+        template_id="divergent_branch",
+        target_op="bra.div",
+        operand_spec={"thr": thr, "a_val": 0xAAAA, "b_val": 0x5555},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Axis 19: pred_composition — and/or/xor.pred at varying thresholds.
+# ---------------------------------------------------------------------------
+
+_COMPOSE_OPS = ("and", "or", "xor")
+_COMPOSE_THR_PAIRS = [
+    (64, 16), (32, 8), (96, 32), (127, 0), (1, 0), (16, 16), (8, 64),
+]
+
+
+def axis_pred_composition_bins() -> list[str]:
+    bins = []
+    for op in _COMPOSE_OPS:
+        for a, b in _COMPOSE_THR_PAIRS:
+            bins.append(f"{op}/a={a}/b={b}")
+    return bins
+
+
+def synthesize_pred_composition(bin_key: str) -> ProbeSpec | None:
+    parts = bin_key.split("/")
+    if len(parts) != 3:
+        return None
+    op, a_part, b_part = parts
+    if op not in _COMPOSE_OPS:
+        return None
+    if not a_part.startswith("a=") or not b_part.startswith("b="):
+        return None
+    try:
+        thr_a = int(a_part[2:])
+        thr_b = int(b_part[2:])
+    except ValueError:
+        return None
+    return ProbeSpec(
+        template_id="pred_composition",
+        target_op=f"{op}.pred",
+        operand_spec={"compose": op, "thr_a": thr_a, "thr_b": thr_b},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Axis 20: shared_barrier — st.shared / bar.sync / ld.shared neighbor read.
+# ---------------------------------------------------------------------------
+
+_SHARED_OFFSETS = [0, 1, 2, 4, 8, 16, 31, 32, 33, 64, 127]
+
+
+def axis_shared_barrier_bins() -> list[str]:
+    return [f"off={n}" for n in _SHARED_OFFSETS]
+
+
+def synthesize_shared_barrier(bin_key: str) -> ProbeSpec | None:
+    if not bin_key.startswith("off="):
+        return None
+    try:
+        off = int(bin_key[4:])
+    except ValueError:
+        return None
+    return ProbeSpec(
+        template_id="shared_barrier",
+        target_op="ld.shared.u32",
+        operand_spec={"offset": off},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Axis 21: hmma — tensor-core mma.sync probes.
+#   Single bin for now (m16n8k16/f16-f32, all-ones oracle).  When this
+#   lands clean we'll add additional shapes (m16n8k8, bf16, f64...).
+# ---------------------------------------------------------------------------
+
+_HMMA_SHAPES = {
+    "m16n8k16/f16_f32/all_ones": (
+        "hmma_m16n8k16",
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32",
+    ),
+    "m16n8k8/f16_f32/all_ones": (
+        "hmma_m16n8k8",
+        "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32",
+    ),
+    "m16n8k16/bf16_f32/all_ones": (
+        "hmma_bf16_m16n8k16",
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32",
+    ),
+    "m16n8k8/tf32_f32/all_ones": (
+        "hmma_tf32_m16n8k8",
+        "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32",
+    ),
+}
+
+
+def axis_hmma_bins() -> list[str]:
+    return list(_HMMA_SHAPES.keys())
+
+
+def synthesize_hmma(bin_key: str) -> ProbeSpec | None:
+    entry = _HMMA_SHAPES.get(bin_key)
+    if entry is None:
+        return None
+    template_id, target_op = entry
+    return ProbeSpec(
+        template_id=template_id,
+        target_op=target_op,
+        operand_spec={},
+    )
+
+
 def axis_auto_dispatch_bins() -> list[str]:
     bins: list[str] = []
     for op, quals in _ptx_cells():
@@ -893,6 +1074,12 @@ AXES: dict[str, tuple[Callable[[], list[str]],
     "bitfield":           (axis_bitfield_bins,         synthesize_bitfield),
     "selp_op":            (axis_selp_op_bins,          synthesize_selp_op),
     "fma_op":             (axis_fma_op_bins,           synthesize_fma_op),
+    "branch_distance":    (axis_branch_distance_bins,  synthesize_branch_distance),
+    "loop_iter":          (axis_loop_iter_bins,        synthesize_loop_iter),
+    "divergent_branch":   (axis_divergent_branch_bins, synthesize_divergent_branch),
+    "pred_composition":   (axis_pred_composition_bins, synthesize_pred_composition),
+    "shared_barrier":     (axis_shared_barrier_bins,   synthesize_shared_barrier),
+    "hmma":               (axis_hmma_bins,             synthesize_hmma),
     "auto_dispatch":      (axis_auto_dispatch_bins,    synthesize_auto_dispatch),
     "regression":         (axis_regression_bins,       synthesize_regression),
 }

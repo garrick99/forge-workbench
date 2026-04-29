@@ -131,6 +131,21 @@ _PTX_TO_SASS_OPCODE_HINTS = {
     "cvt.rn.f32.s32": {0x245},
     "cvt.rzi.u32.f32": {0x305},                             # F2I
     "cvt.rzi.s32.f32": {0x305},
+    # Branches & control flow
+    "bra":           {0x947, 0x94d},                        # BRA / BRX
+    "bra.div":       {0x947, 0x94d},
+    "loop":          {0x947, 0x94d},
+    # Predicate composition: PLOP3 / PSETP encoded forms
+    "and.pred":      {0x81c, 0x71c, 0x70c},                 # PLOP3 / PSETP
+    "or.pred":       {0x81c, 0x71c, 0x70c},
+    "xor.pred":      {0x81c, 0x71c, 0x70c},
+    # Shared memory
+    "ld.shared.u32": {0x984, 0x385},                        # LDS
+    "st.shared.u32": {0x388, 0x988},                        # STS
+    "bar.sync":      {0xb1d},                               # BAR / BARSYNC
+    # Tensor cores: HMMA opcodes vary across SM, broad hint set
+    "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32":
+                     {0x23c, 0x23d, 0x83c, 0x83d, 0x42c, 0x42d, 0x82c, 0x82d},
 }
 
 
