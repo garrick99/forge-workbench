@@ -4817,6 +4817,338 @@ def _cmd_probe_loop(args):
     return 0
 
 
+def _cmd_probe_watch(args):
+    """Long-running harvest watcher: runs probe-harvest-pair on a fixed
+    interval and emits a punch-list file of newly-filed edge_cases.
+
+    This is the discovery-side daemon for 24/7 operation.  Combined with
+    a continuously-running soak (managed by soak_supervisor.ps1's
+    no-stop loop), the pipeline is:
+
+      while True:
+        sleep <interval>
+        run probe-harvest-pair  → cross-confirm + auto-file new edges
+        write punch list to <punch_list_path>
+        (operator / Claude /loop picks up the punch list and dispatches
+         probe-autofix per new edge_id)
+
+    The watcher is idempotent: running probe-harvest-pair multiple times
+    against the same DBs only files NEW clusters (probe-cross-confirm's
+    --auto-file-edges already de-duplicates against existing edges).
+
+    Stops cleanly on Ctrl-C.  Run forever (no --max-cycles) or for a
+    bounded number of cycles for testing.
+    """
+    import argparse as _ap
+    import json
+    import os
+    import subprocess
+    import sys
+    import time
+    from pathlib import Path
+    from workbench.probe import ProbeDB
+
+    interval = max(60, args.interval)  # never poll faster than once a minute
+    punch_list_path = Path(args.punch_list or
+                            (Path(args.db_a).resolve().parent / "autofix_queue.txt"
+                             if Path(args.db_a).resolve().is_dir()
+                             else Path(args.db_a).resolve().parent / "autofix_queue.txt"))
+    punch_list_path.parent.mkdir(parents=True, exist_ok=True)
+
+    print(f"probe-watch:")
+    print(f"  db_a       = {args.db_a}")
+    print(f"  db_b       = {args.db_b}")
+    print(f"  interval   = {interval}s")
+    print(f"  punch list = {punch_list_path}")
+    print(f"  max cycles = {args.max_cycles or '∞'}")
+    print()
+
+    cycle = 0
+    new_edges_total = 0
+    while True:
+        cycle += 1
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+        print(f"[probe-watch] cycle #{cycle} @ {ts}", flush=True)
+
+        # Snapshot pre-harvest edge_id high water
+        try:
+            db = ProbeDB(str(Path(args.db_a).resolve()) if Path(args.db_a).resolve().is_dir()
+                          else str(Path(args.db_a).resolve().parent))
+            pre_max = db.query("SELECT COALESCE(MAX(edge_id), 0) FROM edge_cases")[0][0]
+            db.close()
+        except Exception as e:
+            print(f"  could not read db_a edge_id high-water: {e}")
+            pre_max = -1
+
+        # Run probe-harvest-pair as a subprocess to keep this watcher's
+        # state clean — failures in the harvest don't crash the loop.
+        cmd = [sys.executable, "-m", "workbench", "probe-harvest-pair",
+               args.db_a, args.db_b,
+               "--label-a", args.label_a or "A",
+               "--label-b", args.label_b or "B",
+               "--limit", str(args.limit)]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=args.harvest_timeout)
+        except subprocess.TimeoutExpired:
+            print(f"  TIMEOUT after {args.harvest_timeout}s")
+            time.sleep(interval)
+            continue
+
+        if r.returncode != 0:
+            print(f"  harvest exited {r.returncode}; stdout:")
+            for line in (r.stdout or "").splitlines()[-20:]:
+                print(f"    {line}")
+            print(f"  stderr:")
+            for line in (r.stderr or "").splitlines()[-20:]:
+                print(f"    {line}")
+            time.sleep(interval)
+            continue
+
+        # Pull newly-filed edges from db_a
+        try:
+            db = ProbeDB(str(Path(args.db_a).resolve()) if Path(args.db_a).resolve().is_dir()
+                          else str(Path(args.db_a).resolve().parent))
+            new_rows = db.query(
+                "SELECT edge_id, target_op, template_id, severity, title "
+                "FROM edge_cases WHERE edge_id > ? AND status IN "
+                "('open','investigating','resolved-pending-verify') "
+                "ORDER BY edge_id",
+                (pre_max,))
+            db.close()
+        except Exception as e:
+            new_rows = []
+            print(f"  could not query newly-filed edges: {e}")
+
+        if new_rows:
+            new_edges_total += len(new_rows)
+            print(f"  *** {len(new_rows)} new edge(s) filed (cumulative: "
+                  f"{new_edges_total}) ***")
+            with open(punch_list_path, "a", encoding="utf-8") as f:
+                f.write(f"\n# probe-watch cycle #{cycle} @ {ts}\n")
+                for eid, op, tmpl, sev, title in new_rows:
+                    line = (f"edge_{eid}  [{sev or 'medium':6}]  "
+                            f"{op:32}  {tmpl:18}  {title}")
+                    f.write(line + "\n")
+                    print(f"    {line}")
+                f.write(f"# autofix-cmd: workbench probe-autofix <eid> "
+                        f"--probe-dir <dir> --openptxas-repo <repo>\n")
+        else:
+            print(f"  no new edges (current max edge_id: {pre_max})")
+
+        if args.max_cycles and cycle >= args.max_cycles:
+            print(f"\n[probe-watch] reached max_cycles={args.max_cycles}; stopping")
+            break
+        time.sleep(interval)
+    return 0
+
+
+def _cmd_probe_autofix(args):
+    """Generate a self-contained agent prompt to fix an edge_case
+    end-to-end.
+
+    The output prompt encodes everything an agent needs:
+      - the full PTX reproducer
+      - the canonical bug context (target_op, template, operand_spec)
+      - similar past fixes from fix_history (pattern hints)
+      - repo paths and likely-suspect files
+      - the validation-gate command (probe-commit) and the retry-on-fail
+        loop semantics
+      - hard constraints (no skipping tests, no amending history)
+
+    Default behavior: print the prompt to stdout.  With --output FILE,
+    write to disk instead.  In an interactive Claude session the
+    operator (or assistant) feeds the prompt to the Agent tool — the
+    agent edits openptxas and runs `probe-commit`, which gates on
+    regression-probe + pytest + (optional) validation surface and only
+    commits if all green.  Post-commit hook auto-resolves; live-resolve
+    loop in running soaks picks up the new HEAD and respawns.
+
+    Combined with probe-harvest-pair on the discovery side and
+    probe-commit + post-commit hook on the validation side, this
+    closes the autonomous loop entirely.  The only remaining manual
+    step is choosing WHEN to run it (or wiring a cron / supervisor
+    that runs it on every newly-filed edge_case).
+    """
+    import os
+    import sys
+    from pathlib import Path
+    from workbench.probe import ProbeDB
+
+    db = ProbeDB(args.probe_dir)
+    cur = db.conn.execute(
+        """SELECT edge_id, category, title, description, target_op,
+                  template_id, operand_spec, repro_probe_id, severity,
+                  related_bug, status, notes
+           FROM edge_cases WHERE edge_id = ?""",
+        (args.edge_id,))
+    row = cur.fetchone()
+    if not row:
+        print(f"probe-autofix: edge_{args.edge_id} not found in {args.probe_dir}",
+              file=sys.stderr)
+        db.close()
+        return 2
+
+    (eid, category, title, description, target_op, template_id,
+     operand_spec_json, repro_pid, severity, related_bug,
+     status, notes) = row
+
+    # Pull the PTX of the canonical reproducer for the agent to read.
+    ptx_text = ""
+    if repro_pid:
+        r = db.query("SELECT ptx_sha FROM probes WHERE probe_id = ?",
+                     (repro_pid,))
+        if r and r[0][0]:
+            ptx_text = db.get_ptx(r[0][0]) or ""
+
+    # Recent fixes for the same target_op or related_bug — useful as
+    # pattern hints for the agent.
+    similar = []
+    seen_fix_ids = set()
+    for q, params in [
+        ("SELECT fix_id, fixed_at, fix_commit_sha, fix_summary, "
+         "       related_bug_tag, bug_pattern "
+         "FROM fix_history WHERE target_op = ? "
+         "ORDER BY fixed_at DESC LIMIT 5", (target_op,)),
+        ("SELECT fix_id, fixed_at, fix_commit_sha, fix_summary, "
+         "       related_bug_tag, bug_pattern "
+         "FROM fix_history WHERE related_bug_tag = ? "
+         "ORDER BY fixed_at DESC LIMIT 5", (related_bug,)),
+    ]:
+        if not params or not params[0]:
+            continue
+        for fr in db.query(q, params):
+            if fr[0] in seen_fix_ids:
+                continue
+            seen_fix_ids.add(fr[0])
+            similar.append(fr)
+
+    db.close()
+
+    repo = os.path.abspath(args.openptxas_repo)
+    probe_dir = os.path.abspath(args.probe_dir)
+
+    # ---- Build the prompt ----
+    L = []
+    L.append(f"# Autonomous fix request: edge_{eid}\n")
+    L.append("You are fixing a bug in openptxas, a CUDA PTX→SASS compiler "
+             "targeting NVIDIA SM_120 (Blackwell, RTX 5090).  This prompt "
+             "is the bug context.  Your job is to edit the source tree, "
+             "validate, and commit.\n")
+
+    L.append("## Bug summary")
+    L.append(f"- **Title**: {title}")
+    L.append(f"- **Category**: `{category}` | severity: `{severity or 'medium'}` | status: `{status}`")
+    if related_bug:
+        L.append(f"- **Tag**: `{related_bug}`")
+    if target_op:
+        L.append(f"- **Target op**: `{target_op}`")
+    if template_id:
+        L.append(f"- **Template**: `{template_id}`")
+    if repro_pid:
+        L.append(f"- **Canonical reproducer probe_id**: `{repro_pid}`")
+
+    if description:
+        L.append(f"\n## Description\n{description.strip()}")
+
+    if notes:
+        L.append(f"\n## Notes\n{notes.strip()}")
+
+    if operand_spec_json:
+        L.append(f"\n## Operand spec\n```json\n{operand_spec_json}\n```")
+
+    if ptx_text:
+        L.append(f"\n## PTX reproducer\nThis is the exact PTX whose compilation "
+                 f"surfaces the bug.  When the regression probe runs this PTX "
+                 f"through openptxas + ptxas, ours produces wrong GPU output "
+                 f"(or fails byte_match against ptxas):\n\n```\n"
+                 f"{ptx_text.strip()}\n```")
+
+    L.append(f"\n## Repository layout")
+    L.append(f"- openptxas working tree: `{repo}`")
+    L.append(f"- Probe DB: `{probe_dir}`")
+    L.append(f"- Likely files to investigate / edit:")
+    L.append(f"  - `sass/isel.py` — instruction selection (PTX → SASS)")
+    L.append(f"  - `sass/regalloc.py` — register allocation, live-range analysis")
+    L.append(f"  - `sass/scoreboard.py` — wdep/rbar/wbar slot assignment, latency tracking")
+    L.append(f"  - `sass/pipeline.py` — post-isel passes (FG29, FG32, FG33, FG56b, etc.)")
+    L.append(f"  - `sass/encoding/sm_120_opcodes.py` — SASS encoder functions")
+    L.append(f"  - `sass/schedule.py` — instruction reordering (LDG latency, hazards)")
+
+    if similar:
+        L.append(f"\n## Recent similar fixes (pattern hints)")
+        for (fid, ts, sha, summary, tag, pattern) in similar:
+            sha_s = (sha or "?")[:12]
+            L.append(f"- `{ts}` `{sha_s}` (`{tag or '-'}`): {summary or '(no summary)'}  "
+                     f"_pattern: {(pattern or '-')[:80]}_")
+
+    L.append(f"\n## Your task")
+    L.append("1. **Investigate**: read the PTX above and the relevant openptxas "
+             "files.  Diff what ours emits against what ptxas emits if helpful "
+             "(see `workbench kdiff`).")
+    L.append("2. **Edit**: make code changes (use the Edit tool) that resolve "
+             "the bug.  Keep the change minimal — surgical fixes age better "
+             "than refactors.")
+    L.append(f"3. **Validate + commit + push** by running:")
+    L.append("```")
+    L.append(f"workbench probe-commit \\")
+    L.append(f"    --openptxas-repo {repo} \\")
+    L.append(f"    --probe-dir {probe_dir} \\")
+    L.append(f"    --resolves {eid} \\")
+    L.append(f'    --message "<short fix description>" \\')
+    L.append(f"    --push")
+    L.append("```")
+    L.append("4. **On failure, READ the gate output and revise**:")
+    L.append("   - `[1/3] regression-probe gate FAIL`: your fix does not actually "
+             f"resolve edge_{eid}.  The regression probe still produces wrong GPU "
+             "output.  Re-investigate.")
+    L.append("   - `[2/3] pytest UNEXPECTED failures`: you broke another test.  "
+             "The output lists which tests; investigate each.")
+    L.append("   - `[3/3] validation surface FAIL`: a mower axis you weren't "
+             "targeting regressed.  Your fix has an unintended side-effect.")
+    L.append("5. Retry up to **3 attempts**.  If still failing, report what "
+             "you tried and why each attempt failed.")
+
+    L.append(f"\n## Hard constraints")
+    L.append("- DO NOT modify the regression probe, the validation harness, "
+             "or any test that's expected to pass.")
+    L.append("- DO NOT pass `--no-test-suite` or `--skip-tests` to probe-commit. "
+             "The pytest gate is non-negotiable.")
+    L.append("- DO NOT bypass the post-commit hook (no `--no-verify`, no "
+             "`PROBE_RESOLVE_SKIP=1`).")
+    L.append("- DO NOT amend or rebase prior commits; let probe-commit make a "
+             "new commit on top.")
+    L.append("- DO NOT add narrating comments to the fix code.  The commit "
+             "message carries the explanation.")
+    L.append("- A successful run ends with `probe-commit` returning 0 and your "
+             "push landing on `main`.  The post-commit hook will auto-call "
+             "`probe-resolve`; the live-resolve loop in any running soak will "
+             "detect the HEAD change at its next 250-probe poll, exit code 99, "
+             "and respawn against the new code — automatically verifying your "
+             "fix.")
+
+    L.append(f"\n## What \"done\" looks like")
+    L.append(f"- `probe-commit` exits 0.")
+    L.append(f"- `git -C {repo} log -1 --pretty=%H` shows your new commit.")
+    L.append(f"- `edge_{eid}` status in the DB is `'resolved-pending-verify'` "
+             f"(set by post-commit hook) or `'resolved'` (set by live-resolve "
+             f"loop after the running soak's scanner re-runs the regression).")
+
+    prompt = "\n".join(L) + "\n"
+
+    if args.output:
+        Path(args.output).write_text(prompt, encoding="utf-8")
+        print(f"probe-autofix: prompt written to {args.output} ({len(prompt)} chars)")
+        print()
+        print("To dispatch:")
+        print(f"  - In a Claude session: invoke the Agent tool with this file's contents")
+        print(f"  - Via claude CLI:      claude --print < {args.output}")
+        print(f"  - Manual:              just paste the prompt into a fresh chat")
+    else:
+        sys.stdout.write(prompt)
+    return 0
+
+
 def _cmd_probe_commit(args):
     """Validation gate that mimics human review before a fix lands.
 
@@ -8377,6 +8709,52 @@ def main():
                     "errors; coverage breakdown per axis.")
     p_ps.add_argument("--probe-dir", default=str(DEFAULT_PROBE_DIR))
 
+    # ---- probe-watch: long-running 30-min harvest watcher ----
+    p_pwatch = sub.add_parser(
+        "probe-watch",
+        help="run probe-harvest-pair on a fixed interval and emit a punch "
+             "list of newly-filed edge_cases for autofix dispatch",
+        description="Discovery-side daemon for 24/7 operation.  Runs "
+                    "probe-harvest-pair every --interval seconds; when "
+                    "new cross-confirmed clusters are auto-filed as "
+                    "edge_cases, appends them to the punch-list file.  "
+                    "An operator (or a Claude /loop) picks up the punch "
+                    "list and dispatches probe-autofix for each entry.")
+    p_pwatch.add_argument("db_a", help="first probe DB (file or probe-dir); "
+                                        "this is where new edge_cases get filed")
+    p_pwatch.add_argument("db_b", help="second probe DB")
+    p_pwatch.add_argument("--label-a", default=None)
+    p_pwatch.add_argument("--label-b", default=None)
+    p_pwatch.add_argument("--interval", type=int, default=1800,
+                          help="seconds between harvests (default: 1800 = 30 min, "
+                               "min: 60)")
+    p_pwatch.add_argument("--max-cycles", type=int, default=None,
+                          help="stop after N cycles (default: run forever)")
+    p_pwatch.add_argument("--harvest-timeout", type=int, default=600,
+                          help="seconds before aborting a single harvest run "
+                               "(default: 600)")
+    p_pwatch.add_argument("--punch-list", default=None,
+                          help="path to the queue file new edges are appended "
+                               "to (default: <db_a parent>/autofix_queue.txt)")
+    p_pwatch.add_argument("--limit", type=int, default=30)
+
+    # ---- probe-autofix: generate a self-contained agent fix prompt ----
+    p_paf = sub.add_parser(
+        "probe-autofix",
+        help="generate an autonomous fix prompt for an edge_case",
+        description="Build a self-contained agent prompt that bundles the "
+                    "PTX reproducer, similar past fixes, repo paths, and "
+                    "validation-gate instructions for one tracked edge_case.  "
+                    "Pipe the output to Claude (CLI, session Agent tool, or "
+                    "API); the agent makes code edits and runs probe-commit "
+                    "to close the loop.")
+    p_paf.add_argument("edge_id", type=int, help="edge_case.edge_id to fix")
+    p_paf.add_argument("--probe-dir", default=str(DEFAULT_PROBE_DIR))
+    p_paf.add_argument("--openptxas-repo", required=True,
+                       help="path to the openptxas git working tree")
+    p_paf.add_argument("--output",
+                       help="write prompt to this file (default: stdout)")
+
     # ---- probe-commit: validation gate before pushing a fix ----
     p_pcom = sub.add_parser(
         "probe-commit",
@@ -8840,6 +9218,10 @@ def main():
         return _cmd_probe_init(args)
     if args.cmd == "probe-loop":
         return _cmd_probe_loop(args)
+    if args.cmd == "probe-watch":
+        return _cmd_probe_watch(args)
+    if args.cmd == "probe-autofix":
+        return _cmd_probe_autofix(args)
     if args.cmd == "probe-commit":
         return _cmd_probe_commit(args)
     if args.cmd == "probe-resolve":

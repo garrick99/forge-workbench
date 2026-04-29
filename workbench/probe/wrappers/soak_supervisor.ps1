@@ -37,7 +37,7 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 $ProbeDir   = if ($env:MOWER_PROBE_DIR)  { $env:MOWER_PROBE_DIR }  else { 'C:\mower\probes_long' }
 $LogDir     = if ($env:MOWER_LOG_DIR)    { $env:MOWER_LOG_DIR }    else { 'C:\mower\logs' }
 $WorkDir    = if ($env:MOWER_WORK_DIR)   { $env:MOWER_WORK_DIR }   else { 'C:\mower\forge-workbench' }
-$Workers    = if ($env:MOWER_WORKERS)    { $env:MOWER_WORKERS }    else { '12' }
+$Workers    = if ($env:MOWER_WORKERS)    { $env:MOWER_WORKERS }    else { '8' }
 $Budget     = if ($env:MOWER_BUDGET)     { $env:MOWER_BUDGET }     else { '14400' }
 $MaxProbes  = if ($env:MOWER_MAX_PROBES) { $env:MOWER_MAX_PROBES } else { '100000000' }
 
@@ -104,6 +104,20 @@ while ($true) {
         continue
     }
 
+    if ($code -eq 0) {
+        # Budget exhausted but the soak completed cleanly.  In 24/7 mode
+        # we restart with a fresh log + a rotated soak seed so coverage
+        # keeps expanding.  The supervisor only stops on a non-zero,
+        # non-99 error (which signals something needs attention).
+        "[supervisor] clean budget-exhaust (code 0); restarting for next round in 30s" |
+            Add-Content -Path $log -Encoding utf8
+        $count++
+        Start-Sleep -Seconds 30
+        continue
+    }
+
+    # Anything else is a real error — stop the supervisor so the operator
+    # sees it.  The Scheduled Task records LastTaskResult = $code.
     "[supervisor] terminal exit code $code; supervisor done" |
         Add-Content -Path $log -Encoding utf8
     exit $code
