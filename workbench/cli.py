@@ -4893,6 +4893,100 @@ def _cmd_probe_survey(args):
     return 0
 
 
+def _cmd_probe_edge(args):
+    """Manage the edge-case parking lot — bugs we've documented but
+    haven't fully fixed.  Useful for keeping the mower's active bug
+    surface clean while preserving knowledge for later investigation."""
+    from workbench.probe import ProbeDB
+    db = ProbeDB(args.probe_dir)
+    action = args.action
+
+    if action == "list":
+        rows = db.list_edge_cases(status=args.status, category=args.category)
+        if not rows:
+            print("(no edge cases)")
+            db.close()
+            return 0
+        # The schema: edge_id, discovered_at, category, title, description,
+        # target_op, template_id, operand_spec, repro_probe_id,
+        # repro_n_threads, workaround, severity, status, related_bug, notes.
+        print(f"{'#':>3}  {'sev':<8s} {'cat':<10s} {'status':<14s} {'op':<24s} title")
+        print("-" * 110)
+        for r in rows:
+            edge_id     = r[0]
+            discovered  = r[1]
+            category    = r[2]
+            title       = r[3]
+            target_op   = r[5] or "-"
+            severity    = r[11] or "-"
+            status      = r[12] or "-"
+            print(f"{edge_id:>3}  {severity:<8s} {category:<10s} {status:<14s} "
+                  f"{target_op:<24s} {title}")
+        db.close()
+        return 0
+
+    if action == "add":
+        if not args.title:
+            print("probe-edge add: --title is required", file=sys.stderr)
+            return 2
+        eid = db.add_edge_case(
+            category=args.category or "unknown",
+            title=args.title,
+            description=args.description,
+            target_op=args.target_op,
+            template_id=args.template_id,
+            operand_spec=args.operand_spec,
+            repro_probe_id=args.repro_probe_id,
+            repro_n_threads=args.repro_n_threads,
+            workaround=args.workaround,
+            severity=args.severity or "medium",
+            related_bug=args.related_bug,
+            notes=args.notes,
+        )
+        print(f"added edge_id={eid}")
+        db.close()
+        return 0
+
+    if action == "show":
+        if args.edge_id is None:
+            print("probe-edge show: --edge-id is required", file=sys.stderr)
+            return 2
+        rows = list(db.conn.execute(
+            "SELECT * FROM edge_cases WHERE edge_id = ?", (args.edge_id,)))
+        if not rows:
+            print(f"no edge case with id={args.edge_id}")
+            db.close()
+            return 1
+        cols = [d[0] for d in db.conn.execute(
+            "SELECT * FROM edge_cases LIMIT 0").description]
+        for col, val in zip(cols, rows[0]):
+            print(f"  {col:<18s}: {val}")
+        db.close()
+        return 0
+
+    if action == "update":
+        if args.edge_id is None:
+            print("probe-edge update: --edge-id is required", file=sys.stderr)
+            return 2
+        updates = {}
+        if args.status: updates["status"] = args.status
+        if args.severity: updates["severity"] = args.severity
+        if args.notes: updates["notes"] = args.notes
+        if args.workaround: updates["workaround"] = args.workaround
+        if args.title: updates["title"] = args.title
+        if not updates:
+            print("probe-edge update: no fields to update", file=sys.stderr)
+            return 2
+        db.update_edge_case(args.edge_id, **updates)
+        print(f"updated edge_id={args.edge_id}: {list(updates.keys())}")
+        db.close()
+        return 0
+
+    print(f"probe-edge: unknown action '{action}'", file=sys.stderr)
+    db.close()
+    return 2
+
+
 def _cmd_probe_query(args):
     from workbench.probe import ProbeDB
     db = ProbeDB(args.probe_dir)
@@ -7174,6 +7268,38 @@ def main():
     p_pm2.add_argument("--rule", default=None,
                        help="run a single rule by name (default: all)")
 
+    # ---- probe-edge: manage edge-case parking lot ----
+    p_pe = sub.add_parser(
+        "probe-edge",
+        help="manage documented edge cases (bugs parked for later)",
+        description="Edge cases — known bugs we've chosen not to fix yet "
+                    "but want to document so future investigators can "
+                    "pick them up.  Each row carries a canonical reproducer "
+                    "probe_id so the failing case is always reachable.")
+    p_pe.add_argument("--probe-dir", default=str(DEFAULT_PROBE_DIR))
+    p_pe.add_argument("action", choices=["list", "add", "show", "update"],
+                      help="list edge cases, add a new one, show details, "
+                           "or update fields")
+    p_pe.add_argument("--edge-id", type=int, default=None,
+                      help="edge case id (for show/update)")
+    p_pe.add_argument("--category", default=None,
+                      help="codegen | hazard | template | hardware | "
+                           "encoding | unknown")
+    p_pe.add_argument("--title", default=None)
+    p_pe.add_argument("--description", default=None)
+    p_pe.add_argument("--target-op", default=None)
+    p_pe.add_argument("--template-id", default=None)
+    p_pe.add_argument("--operand-spec", default=None)
+    p_pe.add_argument("--repro-probe-id", type=int, default=None)
+    p_pe.add_argument("--repro-n-threads", type=int, default=None)
+    p_pe.add_argument("--workaround", default=None)
+    p_pe.add_argument("--severity", default=None,
+                      choices=["low", "medium", "high", "blocker"])
+    p_pe.add_argument("--status", default=None,
+                      choices=["open", "investigating", "resolved", "wontfix"])
+    p_pe.add_argument("--related-bug", default=None)
+    p_pe.add_argument("--notes", default=None)
+
     # ---- probe-survey: size the field ----
     p_psv = sub.add_parser(
         "probe-survey",
@@ -7366,6 +7492,8 @@ def main():
         return _cmd_probe_query(args)
     if args.cmd == "probe-survey":
         return _cmd_probe_survey(args)
+    if args.cmd == "probe-edge":
+        return _cmd_probe_edge(args)
     if args.cmd == "encode-fuzz":
         return _cmd_encode_fuzz(args)
     if args.cmd == "leaderboard":

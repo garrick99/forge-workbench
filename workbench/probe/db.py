@@ -84,6 +84,36 @@ CREATE TABLE IF NOT EXISTS rules (
     applied_commit       TEXT
 );
 
+-- Edge-case parking lot.  Bugs we know about but have chosen not to
+-- fix yet (template-induced, deeper-investigation-needed, hardware
+-- weirdness, etc.).  Documenting them here is the key — the mower
+-- excludes them from the active bug surface but the row is searchable
+-- and a future investigator can attack any of them.  The `repro_probe_id`
+-- points at a canonical reproducer (probes.probe_id) so the failing
+-- case is always reachable.
+CREATE TABLE IF NOT EXISTS edge_cases (
+    edge_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    discovered_at    TEXT NOT NULL,
+    category         TEXT NOT NULL,    -- 'codegen' | 'hazard' | 'template' |
+                                       -- 'hardware' | 'encoding' | 'unknown'
+    title            TEXT NOT NULL,    -- short human-readable headline
+    description      TEXT,             -- root cause if known + hypothesis
+    target_op        TEXT,
+    template_id      TEXT,
+    operand_spec     TEXT,
+    repro_probe_id   INTEGER,          -- canonical reproducer (probes.probe_id)
+    repro_n_threads  INTEGER,          -- minimum N to reproduce
+    workaround       TEXT,             -- if any (e.g., "skip in auto-axis")
+    severity         TEXT,             -- 'low' | 'medium' | 'high' | 'blocker'
+    status           TEXT DEFAULT 'open', -- 'open' | 'investigating' |
+                                          -- 'resolved' | 'wontfix'
+    related_bug      TEXT,             -- e.g., "FG29-multi-body-reg" tag
+    notes            TEXT              -- free-form, accumulates over time
+);
+CREATE INDEX IF NOT EXISTS ix_edge_status ON edge_cases(status);
+CREATE INDEX IF NOT EXISTS ix_edge_category ON edge_cases(category);
+CREATE INDEX IF NOT EXISTS ix_edge_op ON edge_cases(target_op);
+
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT
@@ -234,6 +264,55 @@ class ProbeDB:
         """).fetchone()
         return dict(zip(("total", "byte_matches", "correct", "incorrect", "errors"),
                         r))
+
+    # ---- edge cases ----
+
+    def add_edge_case(self, *, category: str, title: str,
+                      target_op: str | None = None,
+                      template_id: str | None = None,
+                      operand_spec: str | None = None,
+                      repro_probe_id: int | None = None,
+                      repro_n_threads: int | None = None,
+                      description: str | None = None,
+                      workaround: str | None = None,
+                      severity: str = "medium",
+                      related_bug: str | None = None,
+                      notes: str | None = None) -> int:
+        """Insert a new edge case.  Returns edge_id."""
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+        cur = self.conn.execute("""
+            INSERT INTO edge_cases (
+                discovered_at, category, title, description,
+                target_op, template_id, operand_spec,
+                repro_probe_id, repro_n_threads,
+                workaround, severity, related_bug, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (ts, category, title, description,
+              target_op, template_id, operand_spec,
+              repro_probe_id, repro_n_threads,
+              workaround, severity, related_bug, notes))
+        self.conn.commit()
+        return cur.lastrowid
+
+    def list_edge_cases(self, status: str | None = None,
+                        category: str | None = None) -> list[tuple]:
+        sql = "SELECT * FROM edge_cases WHERE 1=1"
+        params: list = []
+        if status:
+            sql += " AND status = ?"; params.append(status)
+        if category:
+            sql += " AND category = ?"; params.append(category)
+        sql += " ORDER BY severity DESC, discovered_at DESC"
+        return list(self.conn.execute(sql, params))
+
+    def update_edge_case(self, edge_id: int, **fields) -> None:
+        if not fields:
+            return
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        params = list(fields.values()) + [edge_id]
+        self.conn.execute(f"UPDATE edge_cases SET {sets} WHERE edge_id = ?",
+                          params)
+        self.conn.commit()
 
     def close(self) -> None:
         self.conn.close()
