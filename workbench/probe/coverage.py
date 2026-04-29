@@ -800,6 +800,68 @@ def _bin_key(op: str, quals: frozenset) -> str:
     return f"{op}/{qs}"
 
 
+# ---------------------------------------------------------------------------
+# Axis 15: regression — re-runs of canonical reproducers from edge_cases.
+#   Each open edge case becomes a permanent regression probe.  When the
+#   underlying issue is fixed and `status=resolved`, the probe stays in
+#   the suite forever — no future change can re-introduce the bug
+#   without the mower screaming.
+# ---------------------------------------------------------------------------
+
+def _regression_rows() -> list[tuple]:
+    """Pull (edge_id, target_op, template_id, operand_spec) for open
+    edge cases that have a stored operand_spec.  Read directly from the
+    DB at the default probe-dir."""
+    import json
+    import sqlite3
+    from pathlib import Path
+    db_path = Path(os.environ.get(
+        "PROBE_DIR",
+        os.path.expandvars(r"C:\Users\kraken\openptxas\probes"),
+    )) / "probes.sqlite"
+    if not db_path.exists():
+        return []
+    try:
+        con = sqlite3.connect(str(db_path))
+        rows = list(con.execute("""
+            SELECT edge_id, target_op, template_id, operand_spec, status
+            FROM edge_cases
+            WHERE operand_spec IS NOT NULL AND template_id IS NOT NULL
+        """))
+        con.close()
+        # Keep all (open + resolved) — resolved ones are permanent regression
+        # guards that should re-fail if a regression slips in.
+        return rows
+    except sqlite3.OperationalError:
+        return []  # edge_cases table doesn't exist yet
+
+
+def axis_regression_bins() -> list[str]:
+    return [f"edge_{r[0]}" for r in _regression_rows()]
+
+
+def synthesize_regression(bin_key: str) -> ProbeSpec | None:
+    if not bin_key.startswith("edge_"):
+        return None
+    try:
+        eid = int(bin_key.split("_")[1])
+    except (ValueError, IndexError):
+        return None
+    import json
+    for r in _regression_rows():
+        if r[0] == eid:
+            try:
+                operand = json.loads(r[3])
+            except (json.JSONDecodeError, TypeError):
+                return None
+            return ProbeSpec(
+                template_id=r[2],
+                target_op=r[1] or "regression",
+                operand_spec=operand,
+            )
+    return None
+
+
 def axis_auto_dispatch_bins() -> list[str]:
     bins: list[str] = []
     for op, quals in _ptx_cells():
@@ -832,6 +894,7 @@ AXES: dict[str, tuple[Callable[[], list[str]],
     "selp_op":            (axis_selp_op_bins,          synthesize_selp_op),
     "fma_op":             (axis_fma_op_bins,           synthesize_fma_op),
     "auto_dispatch":      (axis_auto_dispatch_bins,    synthesize_auto_dispatch),
+    "regression":         (axis_regression_bins,       synthesize_regression),
 }
 
 

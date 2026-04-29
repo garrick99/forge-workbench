@@ -77,24 +77,33 @@ def iter_soak(db: ProbeDB, axes: list[str] | None = None,
         # Mutate the spec.  We don't deep-copy (ProbeSpec is a dataclass);
         # build a fresh operand_spec dict.
         os = dict(spec.operand_spec or {})
-        boundary = (0, 1, 0xFF, 0xFFFF, 0x10000, 0xFFFFFFFF, 0x80000000)
+        # Boundary table — sign bits, max/min signed, mask edges, common
+        # bit-fiddle constants.  60% bias toward boundaries; 40% uniform.
+        boundary = (
+            0, 1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128,
+            255, 256, 0xFF, 0xFFFF, 0x10000, 0x7FFF, 0x8000,
+            0x7FFFFFFF, 0x80000000, 0xFFFFFFFF,            # signed/unsigned bounds
+            0x7FFFFFFE, 0x80000001,                          # bounds neighbours
+            0xAAAAAAAA, 0x55555555, 0xCCCCCCCC, 0x33333333, # alternating patterns
+            0xDEADBEEF, 0xCAFEBABE,                          # arbitrary witnesses
+        )
+        def _mut(k):
+            return rng.choice(boundary) if rng.random() < 0.6 \
+                   else rng.randrange(0, 0xFFFFFFFF)
         if "imm" in os:
-            os["imm"] = rng.choice(boundary) if rng.random() < 0.4 \
-                        else rng.randrange(0, 0xFFFFFFFF)
+            os["imm"] = _mut("imm")
         if "gap" in os:
             os["gap"] = rng.randrange(0, 32)
         if "pred_thr" in os:
             os["pred_thr"] = rng.randrange(0, 256)
         if "init_acc" in os:
-            os["init_acc"] = rng.choice(boundary) if rng.random() < 0.4 \
-                             else rng.randrange(0, 0xFFFFFFFF)
+            os["init_acc"] = _mut("init_acc")
         if "init_lo" in os:
-            os["init_lo"] = rng.randrange(0, 0xFFFFFFFF)
+            os["init_lo"] = _mut("init_lo")
         if "init_hi" in os:
-            os["init_hi"] = rng.randrange(0, 0xFFFFFFFF)
+            os["init_hi"] = _mut("init_hi")
         if "arg" in os:
-            os["arg"] = rng.choice(boundary) if rng.random() < 0.4 \
-                        else rng.randrange(0, 0xFFFFFFFF)
+            os["arg"] = _mut("arg")
         # If op_text contains an integer literal, we skip mutation (would
         # need a parser) — the structured fields above carry most variants.
 

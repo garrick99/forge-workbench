@@ -4893,6 +4893,65 @@ def _cmd_probe_survey(args):
     return 0
 
 
+def _cmd_probe_determinism(args):
+    """Re-run stored probes N times each and flag any whose output isn't
+    stable.  Variance = race or hardware non-determinism (both real
+    findings)."""
+    from workbench.probe import ProbeDB
+    from workbench.probe.runner import determinism_check
+    from workbench.probe.generator import ProbeSpec
+    from benchmarks.bench_util import CUDAContext
+    import json
+
+    db = ProbeDB(args.probe_dir)
+    try:
+        ctx = CUDAContext()
+    except Exception as e:
+        print(f"GPU unavailable: {e}", file=sys.stderr)
+        return 2
+
+    sql = ("SELECT probe_id, template_id, target_op, operand_spec "
+           "FROM probes WHERE error IS NULL ")
+    if args.only_correct:
+        sql += "AND gpu_correct = 1 "
+    sql += f"ORDER BY probe_id LIMIT {args.limit}"
+
+    rows = list(db.query(sql))
+    print(f"determinism: {len(rows)} probes × {args.runs} runs "
+          f"= {len(rows) * args.runs} GPU launches")
+
+    n_unstable = 0
+    unstable_rows = []
+    for probe_id, tpl, target_op, op_spec in rows:
+        try:
+            operand = json.loads(op_spec)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        spec = ProbeSpec(template_id=tpl, target_op=target_op,
+                         operand_spec=operand)
+        result = determinism_check(spec, db, ctx=ctx, runs=args.runs)
+        if not result["all_match"]:
+            n_unstable += 1
+            unstable_rows.append((probe_id, target_op, result["n_distinct"]))
+            if args.verbose:
+                print(f"  UNSTABLE probe_id={probe_id}  op={target_op}  "
+                      f"n_distinct={result['n_distinct']}")
+
+    print()
+    print(f"  stable:    {len(rows) - n_unstable}")
+    print(f"  unstable:  {n_unstable}")
+    if unstable_rows and not args.verbose:
+        print()
+        print("  unstable probes (use -v for full list):")
+        for pid, op, n in unstable_rows[:20]:
+            print(f"    probe_id={pid}  op={op}  n_distinct={n}")
+        if len(unstable_rows) > 20:
+            print(f"    ... +{len(unstable_rows) - 20} more")
+    ctx.close()
+    db.close()
+    return 0
+
+
 def _cmd_probe_edge(args):
     """Manage the edge-case parking lot — bugs we've documented but
     haven't fully fixed.  Useful for keeping the mower's active bug
@@ -4900,6 +4959,45 @@ def _cmd_probe_edge(args):
     from workbench.probe import ProbeDB
     db = ProbeDB(args.probe_dir)
     action = args.action
+
+    if action == "stats":
+        rows = list(db.conn.execute("""
+            SELECT status, severity, category, COUNT(*) AS n
+            FROM edge_cases
+            GROUP BY status, severity, category
+            ORDER BY status, severity DESC, category
+        """))
+        if not rows:
+            print("(no edge cases)")
+            db.close()
+            return 0
+        # Totals
+        by_status = {}
+        by_sev = {}
+        by_cat = {}
+        for status, sev, cat, n in rows:
+            by_status[status] = by_status.get(status, 0) + n
+            by_sev[sev] = by_sev.get(sev, 0) + n
+            by_cat[cat] = by_cat.get(cat, 0) + n
+        total = sum(by_status.values())
+        print(f"  total edge cases: {total}")
+        print()
+        print("  by status:")
+        for k in sorted(by_status.keys()):
+            print(f"    {k:<14s}  {by_status[k]}")
+        print()
+        print("  by severity:")
+        sev_order = ["blocker", "high", "medium", "low"]
+        for k in sev_order:
+            if k in by_sev: print(f"    {k:<14s}  {by_sev[k]}")
+        for k, v in sorted(by_sev.items()):
+            if k not in sev_order: print(f"    {k or '-':<14s}  {v}")
+        print()
+        print("  by category:")
+        for k, v in sorted(by_cat.items(), key=lambda kv: -kv[1]):
+            print(f"    {(k or '-'):<14s}  {v}")
+        db.close()
+        return 0
 
     if action == "list":
         rows = db.list_edge_cases(status=args.status, category=args.category)
@@ -7268,6 +7366,24 @@ def main():
     p_pm2.add_argument("--rule", default=None,
                        help="run a single rule by name (default: all)")
 
+    # ---- probe-determinism: re-run probes for variance ----
+    p_pd = sub.add_parser(
+        "probe-determinism",
+        help="re-run stored probes N times each, flag any with output variance",
+        description="Re-running the SAME cubin with the SAME inputs should "
+                    "always produce identical output unless there's a "
+                    "predicate-write-to-read race, scoreboard miss, or "
+                    "hardware non-determinism — all real findings.")
+    p_pd.add_argument("--probe-dir", default=str(DEFAULT_PROBE_DIR))
+    p_pd.add_argument("--runs", type=int, default=5,
+                      help="re-runs per probe (default: 5)")
+    p_pd.add_argument("--limit", type=int, default=200,
+                      help="max number of stored probes to re-test (default: 200)")
+    p_pd.add_argument("--only-correct", action="store_true",
+                      help="only re-test probes that previously passed "
+                           "(focus on stability of currently-passing surface)")
+    p_pd.add_argument("--verbose", "-v", action="store_true")
+
     # ---- probe-edge: manage edge-case parking lot ----
     p_pe = sub.add_parser(
         "probe-edge",
@@ -7277,9 +7393,9 @@ def main():
                     "pick them up.  Each row carries a canonical reproducer "
                     "probe_id so the failing case is always reachable.")
     p_pe.add_argument("--probe-dir", default=str(DEFAULT_PROBE_DIR))
-    p_pe.add_argument("action", choices=["list", "add", "show", "update"],
+    p_pe.add_argument("action", choices=["list", "add", "show", "update", "stats"],
                       help="list edge cases, add a new one, show details, "
-                           "or update fields")
+                           "update fields, or show summary stats")
     p_pe.add_argument("--edge-id", type=int, default=None,
                       help="edge case id (for show/update)")
     p_pe.add_argument("--category", default=None,
@@ -7494,6 +7610,8 @@ def main():
         return _cmd_probe_survey(args)
     if args.cmd == "probe-edge":
         return _cmd_probe_edge(args)
+    if args.cmd == "probe-determinism":
+        return _cmd_probe_determinism(args)
     if args.cmd == "encode-fuzz":
         return _cmd_encode_fuzz(args)
     if args.cmd == "leaderboard":

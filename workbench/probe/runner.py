@@ -201,6 +201,45 @@ def _run_cubin(ctx: CUDAContext, cubin: bytes,
     return raw
 
 
+def determinism_check(spec: ProbeSpec, db: ProbeDB,
+                      ctx: Optional[CUDAContext] = None,
+                      runs: int = 5) -> dict:
+    """Re-run a probe N times and report per-run output variance.
+
+    Re-running the SAME cubin with the SAME inputs should always produce
+    identical output unless there's a race (predicate-write-to-read
+    hazard, scoreboard miss) or hardware non-determinism.  Either is a
+    real finding.
+
+    Returns a dict with:
+      - all_match (bool): True if all N runs produced identical bytes
+      - n_distinct (int): number of distinct output values seen
+      - sample (bytes): the first run's output
+      - variants (list[bytes]): up to 4 distinct output values seen
+    """
+    from .generator import materialize as _mat
+    ptx = _mat(spec)
+    from benchmarks.bench_util import compile_openptxas
+    cubin, _ = compile_openptxas(ptx)
+    extra = spec.template_id in ("load_consume",)
+    outputs: list[bytes] = []
+    if ctx is None:
+        return {"all_match": False, "n_distinct": 0, "sample": None, "variants": []}
+    for _ in range(runs):
+        out = _run_cubin(ctx, cubin, extra_buf=extra)
+        if out is None:
+            outputs.append(b"")
+        else:
+            outputs.append(out)
+    distinct = list({o for o in outputs})
+    return {
+        "all_match": len(distinct) == 1 and outputs[0] != b"",
+        "n_distinct": len(distinct),
+        "sample": outputs[0] if outputs else None,
+        "variants": distinct[:4],
+    }
+
+
 def _check_correct(out: bytes, spec: ProbeSpec) -> bool | None:
     """Compare each tid's output to expected_output(spec, tid).
     Returns True/False, or None if expected is unknown."""
