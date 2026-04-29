@@ -4893,6 +4893,60 @@ def _cmd_probe_survey(args):
     return 0
 
 
+def _cmd_probe_encoder_audit(args):
+    """List every encode_* function in our SASS encoder modules and
+    cross-reference with opcodes the probes have actually emitted.
+    Surfaces 'we have this encoder but never call it' gaps."""
+    from workbench.probe import ProbeDB
+    from workbench.probe.surface import encoder_audit
+
+    db = ProbeDB(args.probe_dir)
+    rep = encoder_audit(db)
+    print(f"encoder audit: {db.db_path}")
+    print(f"  total encoders:     {rep['encoders_total']}")
+    print(f"  callable:           {rep['encoders_callable']}")
+    print(f"  covered (emitted):  {len(rep['covered'])}")
+    print(f"  uncovered (gap):    {len(rep['uncovered'])}")
+    print(f"  errored on probe:   {len(rep['errored'])}")
+    print(f"  distinct seen opcs: {len(rep['seen_opcodes'])}")
+    print()
+
+    if args.show == "uncovered" or args.show == "all":
+        print("  --- UNCOVERED ENCODERS (emit-but-never-tested gaps) ---")
+        # group by opcode
+        by_opc: dict[int, list[str]] = {}
+        for name, opc in rep["uncovered"]:
+            by_opc.setdefault(opc, []).append(name)
+        for opc in sorted(by_opc.keys()):
+            names = by_opc[opc]
+            print(f"    0x{opc:03x}  ({len(names)} variants): "
+                  f"{', '.join(names[:4])}"
+                  + (f"  +{len(names)-4} more" if len(names) > 4 else ""))
+        print()
+
+    if args.show == "covered" or args.show == "all":
+        print("  --- COVERED ENCODERS (have probes emitting them) ---")
+        by_opc2: dict[int, list[str]] = {}
+        for name, opc in rep["covered"]:
+            by_opc2.setdefault(opc, []).append(name)
+        for opc in sorted(by_opc2.keys()):
+            names = by_opc2[opc]
+            print(f"    0x{opc:03x}  ({len(names)} variants): "
+                  f"{', '.join(names[:4])}"
+                  + (f"  +{len(names)-4} more" if len(names) > 4 else ""))
+        print()
+
+    if args.show == "errored" or args.show == "all":
+        print("  --- ERRORED ON PROBE (signature didn't accept defaults) ---")
+        for name, err in rep["errored"][:30]:
+            print(f"    {name}  {err}")
+        if len(rep["errored"]) > 30:
+            print(f"    ... +{len(rep['errored']) - 30} more")
+
+    db.close()
+    return 0
+
+
 def _cmd_probe_determinism(args):
     """Re-run stored probes N times each and flag any whose output isn't
     stable.  Variance = race or hardware non-determinism (both real
@@ -7366,6 +7420,20 @@ def main():
     p_pm2.add_argument("--rule", default=None,
                        help="run a single rule by name (default: all)")
 
+    # ---- probe-encoder-audit: SASS encoder catalog vs emitted opcodes ----
+    p_pea = sub.add_parser(
+        "probe-encoder-audit",
+        help="list SASS encoders and cross-reference with what probes emit",
+        description="Walks every `encode_*` function in our SASS encoder "
+                    "modules, calls each with safe sample args, decodes "
+                    "the opcode, then cross-references with opcodes our "
+                    "probes have actually emitted into cubins.  Uncovered "
+                    "encoders are 'we have the code but never test it' gaps.")
+    p_pea.add_argument("--probe-dir", default=str(DEFAULT_PROBE_DIR))
+    p_pea.add_argument("--show", default="uncovered",
+                       choices=["uncovered", "covered", "errored", "all"],
+                       help="which group to list (default: uncovered)")
+
     # ---- probe-determinism: re-run probes for variance ----
     p_pd = sub.add_parser(
         "probe-determinism",
@@ -7612,6 +7680,8 @@ def main():
         return _cmd_probe_edge(args)
     if args.cmd == "probe-determinism":
         return _cmd_probe_determinism(args)
+    if args.cmd == "probe-encoder-audit":
+        return _cmd_probe_encoder_audit(args)
     if args.cmd == "encode-fuzz":
         return _cmd_encode_fuzz(args)
     if args.cmd == "leaderboard":

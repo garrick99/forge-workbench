@@ -229,6 +229,108 @@ def probe_cells_exercised(db: ProbeDB,
 
 
 # ---------------------------------------------------------------------------
+# Encoder-catalog audit — list every encode_* function and its opcode,
+# then cross-reference against opcodes actually seen in cubins.  Surfaces
+# "we have this encoder but never call it" gaps.
+# ---------------------------------------------------------------------------
+
+def enumerate_encoders(modules: tuple = (
+    "sass.encoding.sm_120_opcodes",
+    "sass.encoding.sm_120_encode",
+)) -> dict[str, dict]:
+    """Walk encoder modules, call each `encode_*` with safe sample args,
+    and return {encoder_name: {opcode, module, sample_bytes, error}}."""
+    import importlib, inspect
+    out: dict[str, dict] = {}
+    for mod_name in modules:
+        try:
+            mod = importlib.import_module(mod_name)
+        except Exception as e:
+            continue
+        for name in dir(mod):
+            if not name.startswith("encode_"):
+                continue
+            fn = getattr(mod, name, None)
+            if not callable(fn):
+                continue
+            sig = None
+            try:
+                sig = inspect.signature(fn)
+            except (TypeError, ValueError):
+                pass
+            # Build sample args: 0 for first 4 positional, 0xFF (RZ) for
+            # remaining register slots, 0 elsewhere.  Catches signatures
+            # we can fill safely; skip if it errors.
+            args: list = []
+            if sig:
+                for i, (pname, param) in enumerate(sig.parameters.items()):
+                    if param.default is not inspect.Parameter.empty:
+                        break  # rest have defaults; stop adding positional
+                    # First 4 positional get 0; later positional get 0xFF (RZ).
+                    args.append(0 if i < 4 else 0xFF)
+            try:
+                raw = fn(*args)
+                if isinstance(raw, (bytes, bytearray)) and len(raw) >= 2:
+                    opc = (raw[0] | (raw[1] << 8)) & 0xFFF
+                    out[name] = {
+                        "opcode": opc,
+                        "module": mod_name.rsplit(".", 1)[-1],
+                        "sample": bytes(raw),
+                        "error": None,
+                    }
+                else:
+                    out[name] = {
+                        "opcode": None, "module": mod_name.rsplit(".", 1)[-1],
+                        "sample": None, "error": "not bytes",
+                    }
+            except Exception as e:
+                out[name] = {
+                    "opcode": None,
+                    "module": mod_name.rsplit(".", 1)[-1],
+                    "sample": None,
+                    "error": f"{type(e).__name__}: {e}",
+                }
+    return out
+
+
+def encoder_audit(db: ProbeDB) -> dict:
+    """Cross-reference encoders with opcodes seen in cubins."""
+    encoders = enumerate_encoders()
+    seen = enumerate_sass_opcodes_seen(db)
+    seen_opcodes = set(seen.keys())
+
+    by_opcode: dict[int, list[str]] = {}
+    for name, info in encoders.items():
+        opc = info["opcode"]
+        if opc is None:
+            continue
+        by_opcode.setdefault(opc, []).append(name)
+
+    covered = []
+    uncovered = []
+    errored = []
+    for name, info in sorted(encoders.items()):
+        if info["error"]:
+            errored.append((name, info["error"]))
+            continue
+        opc = info["opcode"]
+        if opc in seen_opcodes:
+            covered.append((name, opc))
+        else:
+            uncovered.append((name, opc))
+
+    return {
+        "encoders_total": len(encoders),
+        "encoders_callable": len(encoders) - len(errored),
+        "covered": covered,
+        "uncovered": uncovered,
+        "errored": errored,
+        "by_opcode": by_opcode,
+        "seen_opcodes": sorted(seen_opcodes),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Top-level survey — used by the `probe-survey` CLI command
 # ---------------------------------------------------------------------------
 
