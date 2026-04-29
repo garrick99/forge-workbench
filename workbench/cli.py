@@ -4817,6 +4817,249 @@ def _cmd_probe_loop(args):
     return 0
 
 
+def _cmd_probe_commit(args):
+    """Validation gate that mimics human review before a fix lands.
+
+    Workflow:
+      1. Verify the openptxas repo has uncommitted changes (the fix).
+      2. For each --resolves edge_NN: compile the regression probe with
+         the in-tree (uncommitted) openptxas code and run it on the GPU.
+         If gpu_correct != 1, ABORT — fix doesn't actually resolve it.
+      3. Run the openptxas pytest suite.  Compare failures against a
+         baseline (known pre-existing failures, supplied via
+         --baseline-failures or stored in the probe DB's meta table).
+         If unexpected new failures appear, ABORT.
+      4. (Optional) Run a validation surface — a small set of mower
+         axes that should remain green after any fix.  Any new
+         regression there ABORTs.
+      5. If all green, commit with a properly-formatted message that
+         includes `Resolves edge_<NN>[, edge_<MM>...]` so the post-commit
+         hook can auto-call probe-resolve.  Optionally push to remote.
+
+    The mower's running soak is unaffected — it keeps mowing on its
+    current code and picks up the new commit via live-resolve's
+    git-HEAD watch.  Brief GPU contention from this gate's regression
+    probes (sub-second each) is acceptable.
+    """
+    import json
+    import os
+    import subprocess
+    import sys
+    import time
+    from workbench.probe import ProbeDB
+    from workbench.probe.coverage import synthesize_regression
+    from workbench.probe.runner import run_probe
+
+    repo = os.path.abspath(args.openptxas_repo)
+    if not os.path.isdir(os.path.join(repo, '.git')):
+        print(f"probe-commit: not a git repo: {repo}", file=sys.stderr)
+        return 2
+
+    # 1. Verify uncommitted changes exist
+    git_status = subprocess.run(
+        ['git', '-C', repo, 'status', '--porcelain', '--untracked-files=no'],
+        capture_output=True, text=True, timeout=15)
+    if not git_status.stdout.strip():
+        print("probe-commit: no uncommitted changes — nothing to validate")
+        return 1
+    print(f"probe-commit: {len(git_status.stdout.strip().splitlines())} "
+          f"file(s) modified in {repo}")
+
+    # 2. Regression-probe verification
+    edge_ids: list[int] = []
+    for tok in (args.resolves or "").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if tok.startswith("edge_"):
+            tok = tok[5:]
+        try:
+            edge_ids.append(int(tok))
+        except ValueError:
+            print(f"probe-commit: bad --resolves token {tok!r}", file=sys.stderr)
+            return 2
+    if not edge_ids:
+        print("probe-commit: no edges in --resolves; nothing to verify",
+              file=sys.stderr)
+        return 2
+
+    print(f"\n[1/3] regression-probe gate: {len(edge_ids)} edge case(s)")
+    db = ProbeDB(args.probe_dir)
+    from benchmarks.bench_util import CUDAContext
+    ctx = CUDAContext() if not args.no_gpu else None
+    fail = []
+    pass_ = []
+    try:
+        for eid in edge_ids:
+            spec = synthesize_regression(f"edge_{eid}")
+            if spec is None:
+                print(f"  edge_{eid}: NOT FOUND in DB; treating as failure")
+                fail.append(eid)
+                continue
+            t0 = time.time()
+            pid = run_probe(spec, db, ctx=ctx, gpu=ctx is not None)
+            ms = (time.time() - t0) * 1000
+            row = db.query(
+                "SELECT gpu_correct, error FROM probes WHERE probe_id = ?",
+                (pid,))
+            gc = row[0][0] if row else None
+            err = row[0][1] if row and len(row[0]) > 1 else None
+            if gc == 1 and not err:
+                pass_.append(eid)
+                print(f"  edge_{eid:3d}: PASS  ({spec.target_op}, {ms:.0f}ms, probe #{pid})")
+            else:
+                fail.append(eid)
+                print(f"  edge_{eid:3d}: FAIL  gc={gc} err={err!r}  ({spec.target_op}, probe #{pid})")
+    finally:
+        if ctx is not None:
+            ctx.close()
+        db.close()
+
+    if fail:
+        print(f"\nABORT: regression gate failed for {len(fail)} edge(s): {fail}")
+        return 3
+
+    # 3. Pytest gate
+    skip_tests = args.skip_tests or args.no_test_suite
+    if not skip_tests:
+        print(f"\n[2/3] openptxas pytest suite")
+        tests = subprocess.run(
+            [sys.executable, '-m', 'pytest', 'tests/', '--tb=line', '-q',
+             '--no-header'],
+            cwd=repo, capture_output=True, text=True, timeout=900)
+        # Parse failure list from --tb=line output: "FAILED tests/foo.py::Bar"
+        observed = set()
+        for line in tests.stdout.splitlines():
+            if line.startswith('FAILED '):
+                # FAILED tests/path.py::TestClass::test_method - reason
+                test_id = line.split(' ', 1)[1].split(' - ', 1)[0]
+                # Reduce to just the test method short name for matching
+                short = test_id.rsplit('::', 1)[-1]
+                observed.add(short)
+        baseline = set()
+        if args.baseline_failures:
+            baseline = {x.strip() for x in args.baseline_failures.split(',') if x.strip()}
+        else:
+            # Pull from meta table if previously stored
+            db2 = ProbeDB(args.probe_dir)
+            stored = db2.get_meta("test_baseline_failures")
+            db2.close()
+            if stored:
+                try:
+                    baseline = set(json.loads(stored))
+                except (json.JSONDecodeError, TypeError):
+                    pass
+        unexpected = observed - baseline
+        if unexpected:
+            print(f"  pytest: {len(observed)} failures, "
+                  f"{len(observed & baseline)} are baseline-known, "
+                  f"{len(unexpected)} UNEXPECTED")
+            for u in sorted(unexpected):
+                print(f"    - {u}")
+            print(f"\nABORT: pytest regression gate failed.  "
+                  f"If the new failure(s) are intentional, add them to "
+                  f"--baseline-failures or run probe-commit-baseline-update.")
+            return 4
+        print(f"  pytest: all {len(observed)}/{len(observed)} failures are baseline-known")
+    else:
+        print(f"\n[2/3] pytest skipped (--skip-tests or --no-test-suite)")
+
+    # 4. Optional validation surface (mower axes that should stay green)
+    if args.validation_axes:
+        axes = [a.strip() for a in args.validation_axes.split(',') if a.strip()]
+        print(f"\n[3/3] validation surface: {axes}")
+        from workbench.probe.coverage import synthesize, AXES
+        from workbench.probe.runner import _check_correct, _run_cubin
+        from benchmarks.bench_util import compile_openptxas, compile_ptxas, CUDAContext
+        ctx2 = CUDAContext()
+        try:
+            n_fail = 0
+            for ax in axes:
+                if ax not in AXES:
+                    print(f"  {ax}: unknown axis, skipping")
+                    continue
+                bins_fn, _ = AXES[ax]
+                bins = bins_fn()
+                ok = wrong = 0
+                for b in bins:
+                    spec = synthesize(ax, b)
+                    if spec is None: continue
+                    try:
+                        ours_cubin, _ = compile_openptxas(__import__('workbench.probe.generator', fromlist=['materialize']).materialize(spec))
+                        ptxas_cubin, _ = compile_ptxas(__import__('workbench.probe.generator', fromlist=['materialize']).materialize(spec))
+                    except Exception:
+                        wrong += 1
+                        continue
+                    out = _run_cubin(ctx2, ours_cubin)
+                    pout = _run_cubin(ctx2, ptxas_cubin)
+                    if out is None or pout is None:
+                        wrong += 1
+                        continue
+                    if (out == pout) and _check_correct(out, spec) != False:
+                        ok += 1
+                    else:
+                        wrong += 1
+                marker = "OK" if wrong == 0 else "FAIL"
+                print(f"  {ax}: {ok}/{len(bins)} ({marker})")
+                if wrong > 0:
+                    n_fail += 1
+            if n_fail:
+                print(f"\nABORT: validation surface has {n_fail} axis/axes regressing")
+                return 5
+        finally:
+            ctx2.close()
+    else:
+        print(f"\n[3/3] validation surface skipped (use --validation-axes to enable)")
+
+    # All gates passed.  Commit + optional push.
+    print(f"\n=== validation passed; committing ===")
+    if args.dry_run:
+        print("--dry-run set; would commit but stopping here")
+        print(f"  message would be:")
+        print(f"    {args.message}")
+        print(f"    Resolves {', '.join(f'edge_{e}' for e in edge_ids)}")
+        return 0
+
+    # Stage and commit
+    add_res = subprocess.run(['git', '-C', repo, 'add', '-u'],
+                             capture_output=True, text=True, timeout=15)
+    if add_res.returncode != 0:
+        print(f"git add failed: {add_res.stderr}", file=sys.stderr)
+        return 6
+
+    full_msg = (args.message
+                + "\n\nResolves "
+                + ", ".join(f"edge_{e}" for e in edge_ids))
+    if args.coauthor:
+        full_msg += f"\n\nCo-Authored-By: {args.coauthor}"
+
+    commit_res = subprocess.run(
+        ['git', '-C', repo, 'commit', '-m', full_msg],
+        capture_output=True, text=True, timeout=30)
+    if commit_res.returncode != 0:
+        print(f"git commit failed:\n  stdout={commit_res.stdout}\n  "
+              f"stderr={commit_res.stderr}", file=sys.stderr)
+        return 7
+    print(commit_res.stdout)
+
+    new_sha = subprocess.check_output(
+        ['git', '-C', repo, 'rev-parse', 'HEAD'], text=True).strip()
+    print(f"  new HEAD: {new_sha[:12]}")
+
+    if args.push:
+        remote = args.push_remote or "origin"
+        push_res = subprocess.run(
+            ['git', '-C', repo, 'push', remote, 'HEAD:main'],
+            capture_output=True, text=True, timeout=120)
+        if push_res.returncode != 0:
+            print(f"git push failed:\n  stdout={push_res.stdout}\n  "
+                  f"stderr={push_res.stderr}", file=sys.stderr)
+            return 8
+        print(f"  pushed to {remote}/main")
+
+    return 0
+
+
 def _cmd_probe_resolve(args):
     """Record that a fix has been committed for an edge_case.  The
     running scanner picks this up on its next polling tick and
@@ -4934,29 +5177,61 @@ def _cmd_probe_survey(args):
 
 
 def _cmd_probe_install_hook(args):
-    """Install the pre-commit hook into a target git repo."""
+    """Install probe-related git hooks into a target repo.
+
+    Installs by default:
+      - pre-commit: regression-axis check (if installed; bypassed via
+                    PROBE_PRECOMMIT_SKIP=1).
+      - post-commit: parses 'Resolves edge_NN' from the commit message
+                    and auto-calls workbench probe-resolve so the live-
+                    resolve loop in any running soak picks up the fix.
+                    Bypassed via PROBE_RESOLVE_SKIP=1.
+    """
     from pathlib import Path
     import shutil
-    src = Path(__file__).parent / "probe" / "hooks" / "pre-commit"
-    if not src.exists():
-        print(f"hook source not found at {src}", file=sys.stderr)
-        return 1
     repo = Path(args.repo)
     if not (repo / ".git").exists():
         print(f"{repo} is not a git repo", file=sys.stderr)
         return 1
-    dst = repo / ".git" / "hooks" / "pre-commit"
-    if dst.exists() and not args.force:
-        print(f"{dst} already exists.  --force to overwrite.", file=sys.stderr)
-        return 1
-    shutil.copy(src, dst)
-    try:
-        dst.chmod(0o755)
-    except Exception:
-        pass
-    print(f"installed pre-commit hook → {dst}")
-    print("  set PROBE_PRECOMMIT_SKIP=1 to bypass on a single commit")
-    return 0
+
+    hooks_src = Path(__file__).parent / "probe" / "hooks"
+    which = (args.which or "all").lower()
+    targets = []
+    if which in ("all", "pre-commit"):
+        targets.append("pre-commit")
+    if which in ("all", "post-commit"):
+        targets.append("post-commit")
+    if not targets:
+        print(f"unknown --which value {args.which!r}; expected pre-commit, "
+              f"post-commit, or all", file=sys.stderr)
+        return 2
+
+    installed = []
+    for name in targets:
+        src = hooks_src / name
+        if not src.exists():
+            print(f"  {name}: source missing at {src}; skipping", file=sys.stderr)
+            continue
+        dst = repo / ".git" / "hooks" / name
+        if dst.exists() and not args.force:
+            print(f"  {name}: {dst} already exists; --force to overwrite",
+                  file=sys.stderr)
+            continue
+        shutil.copy(src, dst)
+        try:
+            dst.chmod(0o755)
+        except Exception:
+            pass
+        installed.append(name)
+        print(f"  installed {name} hook → {dst}")
+
+    if "post-commit" in installed:
+        print("  bypass post-commit on a single commit: PROBE_RESOLVE_SKIP=1")
+        print("  override probe-dir: PROBE_DIR=<path>  (default: search common "
+              "layouts)")
+    if "pre-commit" in installed:
+        print("  bypass pre-commit on a single commit: PROBE_PRECOMMIT_SKIP=1")
+    return 0 if installed else 1
 
 
 def _cmd_probe_snapshot(args):
@@ -5603,6 +5878,79 @@ def _cmd_probe_query(args):
     print(f"\n{len(rows)} row(s)")
     db.close()
     return 0
+
+
+def _cmd_probe_harvest_pair(args):
+    """One-shot harvest: run probe-cross-confirm with --auto-file-edges
+    against two probe DBs (typically BigDaddy + GreenDragon), then
+    print a punch list of newly-filed edge_cases ready for fixing.
+
+    The intended workflow loop:
+
+        soak (machine A)  ┐
+                          ├── probe-harvest-pair --auto-file-edges
+        soak (machine B)  ┘            ↓
+                                 fresh edge_cases in db_a
+                                       ↓
+                              [human or agent writes fix]
+                                       ↓
+                              probe-commit --resolves edge_NN
+                                       ↓
+                              live-resolve loop in running soaks
+                              picks up the commit → respawn → verify
+                                       ↓
+                              edge_case auto-promoted to 'resolved'
+
+    Equivalent to:
+        probe-cross-confirm <db_a> <db_b> --auto-file-edges \\
+        + a follow-up SELECT to summarise the newly-filed edges.
+    """
+    import argparse as _ap
+    # Synthesize the args object probe-cross-confirm expects
+    cc_args = _ap.Namespace(
+        db_a=args.db_a, db_b=args.db_b,
+        label_a=args.label_a, label_b=args.label_b,
+        limit=args.limit,
+        auto_file_edges=True,
+        fail_on_bugs=False,
+    )
+    # Snapshot the pre-harvest edge_id high-water mark so we can list
+    # the newly-filed entries afterward.
+    from workbench.probe import ProbeDB
+    import os as _os
+    src_a = args.db_a if _os.path.isfile(args.db_a) else _os.path.join(args.db_a, "probes.sqlite")
+    db_dir = _os.path.dirname(src_a)
+    db_pre = ProbeDB(db_dir)
+    pre_max = db_pre.query("SELECT COALESCE(MAX(edge_id), 0) FROM edge_cases")[0][0]
+    db_pre.close()
+
+    rc = _cmd_probe_cross_confirm(cc_args)
+
+    db_post = ProbeDB(db_dir)
+    new_rows = db_post.query(
+        "SELECT edge_id, target_op, template_id, severity, title FROM edge_cases "
+        "WHERE edge_id > ? AND status IN ('open','investigating','resolved-pending-verify') "
+        "ORDER BY edge_id",
+        (pre_max,))
+    db_post.close()
+
+    print()
+    if new_rows:
+        print(f"=== newly-filed edge_cases ({len(new_rows)}) — punch list ===")
+        for eid, op, tmpl, sev, title in new_rows:
+            print(f"  edge_{eid:3d}  [{sev or 'medium':6}]  {op:32}  {tmpl:18}  {title}")
+        print()
+        print("Next steps:")
+        print(f"  1. Investigate any of the above (probe DBs: {db_dir})")
+        print(f"  2. After writing a fix, validate + commit with:")
+        print(f"       workbench probe-commit --openptxas-repo <path> \\")
+        print(f"           --resolves edge_<NN>[,edge_<MM>] --message \"...\" --push")
+        print(f"  3. Live-resolve loop in running soaks picks it up automatically.")
+    else:
+        print("=== no new edge_cases filed ===")
+        print("(either all cross-confirmed clusters already had edges, or no "
+              "cross-confirmed bugs surfaced)")
+    return rc
 
 
 def _cmd_probe_cross_confirm(args):
@@ -8029,6 +8377,53 @@ def main():
                     "errors; coverage breakdown per axis.")
     p_ps.add_argument("--probe-dir", default=str(DEFAULT_PROBE_DIR))
 
+    # ---- probe-commit: validation gate before pushing a fix ----
+    p_pcom = sub.add_parser(
+        "probe-commit",
+        help="validation gate: prove a fix resolves edge cases with zero "
+             "regression, then commit",
+        description="Mimics human review of an uncommitted fix in the "
+                    "openptxas repo.  Runs the regression probes for each "
+                    "--resolves edge_NN, runs the openptxas pytest suite "
+                    "(comparing against a baseline of pre-existing failures), "
+                    "optionally runs a validation surface of mower axes, "
+                    "then commits with a properly-formatted 'Resolves edge_NN' "
+                    "message that the post-commit hook can pick up.  "
+                    "Designed to keep the mower train rolling — the running "
+                    "soak is unaffected; it picks up the new commit via "
+                    "live-resolve's git-HEAD watch.")
+    p_pcom.add_argument("--probe-dir", default=str(DEFAULT_PROBE_DIR))
+    p_pcom.add_argument("--openptxas-repo", required=True,
+                        help="path to the openptxas git working tree to validate")
+    p_pcom.add_argument("--resolves", required=True,
+                        help="comma-separated edge_ids the fix claims to "
+                             "resolve, e.g. '54' or 'edge_54,edge_55'")
+    p_pcom.add_argument("--message", required=True,
+                        help="one-line commit subject (will get 'Resolves "
+                             "edge_NN' appended in the body)")
+    p_pcom.add_argument("--baseline-failures",
+                        help="comma-separated pytest test names that are "
+                             "expected to fail (pre-existing); defaults to "
+                             "the value in the probe DB's meta table")
+    p_pcom.add_argument("--validation-axes",
+                        help="comma-separated mower axes to run as a "
+                             "validation surface (e.g. 'pred_composition,hmma'); "
+                             "any axis with a regressing probe ABORTs")
+    p_pcom.add_argument("--no-gpu", action="store_true",
+                        help="skip GPU runs (compile-only validation)")
+    p_pcom.add_argument("--no-test-suite", action="store_true",
+                        help="skip the openptxas pytest run (DANGEROUS)")
+    p_pcom.add_argument("--skip-tests", action="store_true",
+                        help="alias for --no-test-suite")
+    p_pcom.add_argument("--dry-run", action="store_true",
+                        help="run all gates but do not commit")
+    p_pcom.add_argument("--push", action="store_true",
+                        help="git push to remote after a successful commit")
+    p_pcom.add_argument("--push-remote", default=None,
+                        help="git remote name for --push (default: origin)")
+    p_pcom.add_argument("--coauthor",
+                        help="add a Co-Authored-By trailer to the commit")
+
     # ---- probe-resolve: record a fix for an edge case ----
     p_pr_resolve = sub.add_parser(
         "probe-resolve",
@@ -8068,14 +8463,17 @@ def main():
     p_pm2.add_argument("--rule", default=None,
                        help="run a single rule by name (default: all)")
 
-    # ---- probe-install-hook: install git pre-commit hook ----
+    # ---- probe-install-hook: install git pre/post-commit hooks ----
     p_pih = sub.add_parser(
         "probe-install-hook",
-        help="install the regression-axis pre-commit hook in a git repo")
+        help="install probe-related git hooks (pre-commit + post-commit)")
     p_pih.add_argument("--repo", required=True,
                        help="path to the git repo to install into")
     p_pih.add_argument("--force", action="store_true",
-                       help="overwrite existing hook")
+                       help="overwrite existing hook(s)")
+    p_pih.add_argument("--which", default="all",
+                       choices=["all", "pre-commit", "post-commit"],
+                       help="which hooks to install (default: all)")
 
     # ---- probe-snapshot: surface coverage delta over time ----
     p_psn = sub.add_parser(
@@ -8235,6 +8633,24 @@ def main():
                     "exploratory analysis.")
     p_pq.add_argument("sql", help="SQL query to execute")
     p_pq.add_argument("--probe-dir", default=str(DEFAULT_PROBE_DIR))
+
+    # ---- probe-harvest-pair: cross-confirm + auto-file in one shot ----
+    p_php = sub.add_parser(
+        "probe-harvest-pair",
+        help="cross-confirm two soak DBs and auto-file new edge_cases",
+        description="One-shot post-soak harvest: runs probe-cross-confirm "
+                    "with --auto-file-edges between two probe DBs (typically "
+                    "BigDaddy + GreenDragon), then prints a punch list of "
+                    "newly-filed edge_cases ready for fixing.  Closes the "
+                    "discovery side of the autonomous loop — combined with "
+                    "probe-commit on the fix side, the only manual step is "
+                    "writing the fix code.")
+    p_php.add_argument("db_a", help="first probe DB (file or probe-dir); "
+                                     "this is where new edge_cases get filed")
+    p_php.add_argument("db_b", help="second probe DB")
+    p_php.add_argument("--label-a", help="display label for db_a")
+    p_php.add_argument("--label-b", help="display label for db_b")
+    p_php.add_argument("--limit", type=int, default=20)
 
     # ---- probe-cross-confirm: cross-machine bug attribution ----
     p_pcc = sub.add_parser(
@@ -8424,6 +8840,8 @@ def main():
         return _cmd_probe_init(args)
     if args.cmd == "probe-loop":
         return _cmd_probe_loop(args)
+    if args.cmd == "probe-commit":
+        return _cmd_probe_commit(args)
     if args.cmd == "probe-resolve":
         return _cmd_probe_resolve(args)
     if args.cmd == "probe-stats":
@@ -8432,6 +8850,8 @@ def main():
         return _cmd_probe_mine(args)
     if args.cmd == "probe-cross-confirm":
         return _cmd_probe_cross_confirm(args)
+    if args.cmd == "probe-harvest-pair":
+        return _cmd_probe_harvest_pair(args)
     if args.cmd == "probe-query":
         return _cmd_probe_query(args)
     if args.cmd == "probe-survey":

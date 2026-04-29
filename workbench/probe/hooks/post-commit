@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# post-commit hook: auto-runs `workbench probe-resolve` for each
+# `Resolves edge_NN` line in the commit message.  Triggered by
+# `probe-commit` (which builds those lines) but works for any
+# manual commit that follows the convention.
+#
+# Set PROBE_RESOLVE_SKIP=1 to bypass on a single commit.
+# Set PROBE_DIR to override the probe DB path (default: $HOME/openptxas/probes).
+
+set -u
+[[ "${PROBE_RESOLVE_SKIP:-0}" == "1" ]] && exit 0
+
+# Locate the probe DB.  Prefer PROBE_DIR env var; else try common
+# layouts.  If we can't find a DB, exit silently — this hook should
+# never block a commit.
+PROBE_DIR="${PROBE_DIR:-}"
+if [[ -z "$PROBE_DIR" ]]; then
+    for cand in \
+        "$HOME/openptxas/probes" \
+        "/c/Users/kraken/openptxas/probes" \
+        "C:/mower/probes_long" \
+    ; do
+        if [[ -f "$cand/probes.sqlite" ]]; then
+            PROBE_DIR="$cand"
+            break
+        fi
+    done
+fi
+if [[ -z "$PROBE_DIR" || ! -f "$PROBE_DIR/probes.sqlite" ]]; then
+    echo "[post-commit] no probe DB found; skipping probe-resolve" >&2
+    exit 0
+fi
+
+# Locate workbench.  If the user has a python that imports workbench
+# in PATH, use it.  Otherwise try common venv paths.
+PY="${PYTHON:-python}"
+if ! "$PY" -c 'import workbench' >/dev/null 2>&1; then
+    for cand in \
+        "/c/Users/kraken/forge-workbench/.venv/Scripts/python.exe" \
+        "$HOME/forge-workbench/.venv/bin/python" \
+    ; do
+        if [[ -x "$cand" ]] && "$cand" -c 'import workbench' >/dev/null 2>&1; then
+            PY="$cand"
+            break
+        fi
+    done
+    if ! "$PY" -c 'import workbench' >/dev/null 2>&1; then
+        echo "[post-commit] no python with workbench module; skipping" >&2
+        exit 0
+    fi
+fi
+
+# Pull the commit message from the commit we just made (HEAD).
+MSG="$(git log -1 --pretty=%B HEAD)"
+SHA="$(git rev-parse HEAD)"
+
+# Parse `Resolves edge_NN[, edge_MM]...` (one or more lines, multiple per line).
+# Accept slight variations: "Resolves: edge_NN", "Closes edge_NN".
+EDGES="$(echo "$MSG" | grep -iE '^[[:space:]]*(Resolves|Closes|Fixes)[[:space:]:]' | \
+    grep -oE 'edge_[0-9]+' | grep -oE '[0-9]+' | sort -u)"
+
+if [[ -z "$EDGES" ]]; then
+    # No Resolves trailer — nothing to do.
+    exit 0
+fi
+
+# Pull a one-line summary from the commit subject for the resolution log.
+SUMMARY="$(echo "$MSG" | head -1 | sed 's/"/\\"/g')"
+
+echo "[post-commit] commit $SHA:"
+echo "[post-commit]   subject: $SUMMARY"
+for eid in $EDGES; do
+    echo "[post-commit]   resolving edge_$eid against $PROBE_DIR"
+    "$PY" -m workbench probe-resolve \
+        --probe-dir "$PROBE_DIR" \
+        "$eid" \
+        --commit "$SHA" \
+        --summary "$SUMMARY" \
+        2>&1 | sed 's/^/[post-commit]     /'
+done
+
+# Never fail the commit on hook errors.
+exit 0
