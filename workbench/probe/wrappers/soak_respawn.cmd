@@ -1,45 +1,25 @@
 @echo off
-REM Live-resolve soak supervisor: re-spawns the probe-loop when the
-REM scheduler exits with code 99 (RESPAWN_EXIT_CODE).  This lets a
-REM running soak pick up a code fix without operator intervention.
+REM Thin shim — the Scheduled Task points at THIS file.  All logic lives
+REM in soak_supervisor.ps1, which PowerShell parses into memory at start,
+REM so editing the .ps1 mid-run can't race a running supervisor.
 REM
-REM Usage from a Scheduled Task or shell:
-REM   soak_respawn.cmd <probe-dir> <log-file> [extra args]
+REM Why a shim and not "just put the .ps1 in the task action":
+REM the Scheduled Task config on GreenDragon (and the install pattern in
+REM reference_greendragon_mower.md) launches `cmd.exe /c <file>`.  Keeping
+REM a .cmd entry-point means the task action doesn't change; we only swap
+REM what's INSIDE the cmd.
 REM
-REM The wrapper inherits PYTHONIOENCODING / PYTHONPATH / OPENPTXAS_ISEL
-REM / MOWER_MAX_WORKERS from the caller's environment.  Default
-REM probe-loop args: --soak --budget 14400 --workers 4.
+REM This shim is intentionally trivial (one runnable line) so that even
+REM if cmd.exe's mid-execution file re-read does fire, there's nothing
+REM here to mis-execute.  The previous wrapper had ~50 lines of logic
+REM that re-read mid-run after an in-place edit and spawned an orphan
+REM python on Win11 build 26200 (where wmic is missing).
+REM
+REM Sibling layout (both files in same dir):
+REM   <dir>\soak_respawn.cmd      ← this file (Scheduled Task target)
+REM   <dir>\soak_supervisor.ps1   ← real supervisor
 
 setlocal
-if "%~1"=="" (
-    echo usage: soak_respawn.cmd ^<probe-dir^> ^<log-file^> [extra args]
-    exit /b 2
-)
-set "PROBE_DIR=%~1"
-set "LOG_FILE=%~2"
-shift
-shift
-
-set "EXTRA="
-:collect_args
-if "%~1"=="" goto :run
-set "EXTRA=%EXTRA% %1"
-shift
-goto :collect_args
-
-:run
-set "RESPAWN_COUNT=0"
-:loop
-echo [supervisor] === probe-loop starting (respawn count: %RESPAWN_COUNT%) === >> "%LOG_FILE%"
-echo [supervisor] start: %DATE% %TIME% >> "%LOG_FILE%"
-python -m workbench probe-loop --probe-dir "%PROBE_DIR%" --soak --budget 14400 --max-probes 100000000 --workers 4 %EXTRA% >> "%LOG_FILE%" 2>&1
-set EXITCODE=%ERRORLEVEL%
-echo [supervisor] exit: %DATE% %TIME%  code=%EXITCODE% >> "%LOG_FILE%"
-if %EXITCODE% EQU 99 (
-    echo [supervisor] respawn requested (code 99); restarting in 5s >> "%LOG_FILE%"
-    set /a RESPAWN_COUNT+=1
-    timeout /t 5 /nobreak > /dev/null
-    goto :loop
-)
-echo [supervisor] terminal exit code %EXITCODE%; supervisor done >> "%LOG_FILE%"
-exit /b %EXITCODE%
+set "_SHIM_DIR=%~dp0"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%_SHIM_DIR%soak_supervisor.ps1"
+exit /b %ERRORLEVEL%
