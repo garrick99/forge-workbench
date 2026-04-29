@@ -5605,6 +5605,170 @@ def _cmd_probe_query(args):
     return 0
 
 
+def _cmd_probe_cross_confirm(args):
+    """Cross-machine bug attribution.
+
+    Joins two probe DBs on (template_id, ptx_sha) — the same probe run on
+    both machines — and buckets each shared probe by its (gpu_correct_a,
+    gpu_correct_b) pair:
+
+      - both_correct (1, 1):    confirmed working on both
+      - both_wrong   (0, 0):    cross-confirmed deterministic codegen bug
+                                — both RTX 5090s on identical drivers agree
+                                ours produces wrong output, so this is a
+                                real codegen issue not hardware noise
+      - a_only_wrong (0, 1):    single-host failure — likely timing /
+                                scheduling sensitivity, lower triage
+                                priority
+      - b_only_wrong (1, 0):    same, opposite host
+
+    Optional --auto-file-edges files an edge_case for each (template_id,
+    target_op, target_opcode) cluster of cross-confirmed bugs that
+    doesn't already have one.  The new edges land in the FIRST DB
+    (--db-a is treated as the canonical one) and become regression
+    probes via the existing regression axis.
+    """
+    import os
+    import sqlite3
+    import time
+    def _resolve_db(path: str, name: str) -> str | None:
+        # Accept either a probe-dir or a direct path to probes.sqlite.
+        p = os.path.abspath(path)
+        if os.path.isdir(p):
+            cand = os.path.join(p, "probes.sqlite")
+            if os.path.isfile(cand):
+                return cand
+            print(f"workbench probe-cross-confirm: {name} dir has no "
+                  f"probes.sqlite: {p}", file=sys.stderr)
+            return None
+        if os.path.isfile(p):
+            return p
+        print(f"workbench probe-cross-confirm: {name} not found: {p}",
+              file=sys.stderr)
+        return None
+
+    db_a = _resolve_db(args.db_a, "db_a")
+    db_b = _resolve_db(args.db_b, "db_b")
+    if db_a is None or db_b is None:
+        return 2
+    label_a = args.label_a or os.path.basename(os.path.dirname(db_a))
+    label_b = args.label_b or os.path.basename(os.path.dirname(db_b))
+
+    conn = sqlite3.connect(db_a)
+    conn.execute(f"ATTACH DATABASE '{db_b}' AS dbb")
+
+    # Per-bucket counts at the cluster level (template_id, target_op,
+    # target_opcode).  Treat NULL gpu_correct as "not run on this side".
+    sql_clusters = """
+        SELECT a.template_id, a.target_op, a.target_opcode,
+               COUNT(*)                                          AS n_shared,
+               SUM(CASE WHEN a.gpu_correct=1 AND b.gpu_correct=1 THEN 1 ELSE 0 END) AS both_correct,
+               SUM(CASE WHEN a.gpu_correct=0 AND b.gpu_correct=0 THEN 1 ELSE 0 END) AS both_wrong,
+               SUM(CASE WHEN a.gpu_correct=0 AND b.gpu_correct=1 THEN 1 ELSE 0 END) AS a_only,
+               SUM(CASE WHEN a.gpu_correct=1 AND b.gpu_correct=0 THEN 1 ELSE 0 END) AS b_only,
+               MIN(a.probe_id)                                   AS canonical_a,
+               MIN(b.probe_id)                                   AS canonical_b
+        FROM probes a
+        JOIN dbb.probes b
+          ON a.template_id = b.template_id AND a.ptx_sha = b.ptx_sha
+        WHERE a.gpu_correct IS NOT NULL AND b.gpu_correct IS NOT NULL
+        GROUP BY a.template_id, a.target_op, a.target_opcode
+        ORDER BY both_wrong DESC, a_only + b_only DESC
+    """
+    rows = list(conn.execute(sql_clusters))
+
+    totals = {"shared": 0, "both_correct": 0, "both_wrong": 0,
+              "a_only": 0, "b_only": 0}
+    for _, _, _, n, bc, bw, ao, bo, _, _ in rows:
+        totals["shared"]       += n
+        totals["both_correct"] += bc
+        totals["both_wrong"]   += bw
+        totals["a_only"]       += ao
+        totals["b_only"]       += bo
+
+    print(f"probe-cross-confirm")
+    print(f"  db_a = {db_a}  (label: {label_a})")
+    print(f"  db_b = {db_b}  (label: {label_b})")
+    print()
+    print(f"shared probes (joined on template_id+ptx_sha): {totals['shared']}")
+    print(f"  both_correct                  : {totals['both_correct']}")
+    print(f"  both_wrong (cross-confirmed)  : {totals['both_wrong']}")
+    print(f"  {label_a}-only wrong   : {totals['a_only']}")
+    print(f"  {label_b}-only wrong   : {totals['b_only']}")
+    print()
+
+    cross_clusters = [(t, op, opc, bw, ca, cb)
+                      for (t, op, opc, _n, _bc, bw, _ao, _bo, ca, cb) in rows
+                      if bw > 0]
+    div_clusters   = [(t, op, opc, ao, bo)
+                      for (t, op, opc, _n, _bc, _bw, ao, bo, _ca, _cb) in rows
+                      if (ao > 0 or bo > 0) and ao + bo > 0]
+
+    if cross_clusters:
+        print(f"=== cross-confirmed bug clusters ({len(cross_clusters)}) ===")
+        print(f"  {'count':>6}  {'opcode':>6}  template_id            target_op")
+        for t, op, opc, bw, ca, cb in cross_clusters[:args.limit]:
+            opc_s = f"{opc:#06x}" if opc is not None else "  ?  "
+            print(f"  {bw:>6}  {opc_s:>6}  {t:<22}  {op}")
+        if len(cross_clusters) > args.limit:
+            print(f"  ... + {len(cross_clusters) - args.limit} more "
+                  f"(use --limit N)")
+        print()
+    else:
+        print("=== cross-confirmed bug clusters: (none) ===\n")
+
+    if div_clusters:
+        print(f"=== single-host divergences ({len(div_clusters)}) ===")
+        print(f"  {label_a}_only / {label_b}_only  template_id  target_op")
+        for t, op, _opc, ao, bo in div_clusters[:args.limit]:
+            print(f"  {ao:>4} / {bo:<4}  {t:<22}  {op}")
+        if len(div_clusters) > args.limit:
+            print(f"  ... + {len(div_clusters) - args.limit} more")
+        print()
+
+    if args.auto_file_edges and cross_clusters:
+        # File edge_cases for cross-confirmed clusters that don't already
+        # have one matching this (template_id, target_op).
+        from workbench.probe import ProbeDB
+        edge_db = ProbeDB(os.path.dirname(db_a))
+        existing = set()
+        for (eid_op, eid_tmpl) in edge_db.query(
+                "SELECT target_op, template_id FROM edge_cases "
+                "WHERE status IN ('open','investigating','resolved-pending-verify')"):
+            existing.add((eid_op, eid_tmpl))
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+        n_filed = 0
+        for t, op, opc, bw, ca, _cb in cross_clusters:
+            if (op, t) in existing:
+                continue
+            opc_s = f"{opc:#06x}" if opc is not None else "?"
+            row = edge_db.query(
+                "SELECT operand_spec FROM probes WHERE probe_id = ?", (ca,))
+            opspec = row[0][0] if row else None
+            eid = edge_db.add_edge_case(
+                category="codegen",
+                title=f"cross-confirmed: {op} {t} (opcode {opc_s})",
+                description=(f"Cross-machine confirmed by {label_a}+{label_b} "
+                             f"on {ts}: {bw} probe(s) with this "
+                             f"(template, target_op, opcode) tuple were "
+                             f"GPU-incorrect on BOTH machines."),
+                target_op=op,
+                template_id=t,
+                operand_spec=opspec,
+                repro_probe_id=ca,
+                severity="high",
+                related_bug=f"cross-confirm-{label_a}-{label_b}",
+                notes=f"auto-filed by probe-cross-confirm at {ts}",
+            )
+            n_filed += 1
+        print(f"auto-filed {n_filed} new edge_case(s) into {db_a}")
+        edge_db.close()
+
+    conn.close()
+    # Exit non-zero if there are cross-confirmed bugs (useful for CI)
+    return 1 if (totals["both_wrong"] > 0 and args.fail_on_bugs) else 0
+
+
 def _cmd_disasm(args):
     """Decode a hex-encoded SASS instruction (16 bytes) into mnemonic +
     field breakdown.  Inverse of `encode`.  Useful when staring at raw
@@ -8072,6 +8236,35 @@ def main():
     p_pq.add_argument("sql", help="SQL query to execute")
     p_pq.add_argument("--probe-dir", default=str(DEFAULT_PROBE_DIR))
 
+    # ---- probe-cross-confirm: cross-machine bug attribution ----
+    p_pcc = sub.add_parser(
+        "probe-cross-confirm",
+        help="cross-machine bug attribution (joins two probe DBs)",
+        description="Joins two probe DBs on (template_id, ptx_sha) — the "
+                    "same probe run on both machines — and buckets findings "
+                    "into both_correct, both_wrong (cross-confirmed: "
+                    "deterministic codegen bug), or single-host divergence "
+                    "(likely flaky / timing-sensitive).  With identical RTX "
+                    "5090 silicon + driver versions on BigDaddy and "
+                    "GreenDragon, anything in 'both_wrong' is high-signal "
+                    "real codegen.  Single-host findings are deprioritized.")
+    p_pcc.add_argument("db_a",
+                       help="path to first probe DB (file or probe-dir)")
+    p_pcc.add_argument("db_b",
+                       help="path to second probe DB")
+    p_pcc.add_argument("--label-a", help="display label for db_a "
+                                          "(default: parent dir name)")
+    p_pcc.add_argument("--label-b", help="display label for db_b")
+    p_pcc.add_argument("--limit", type=int, default=20,
+                       help="max clusters to list per category (default: 20)")
+    p_pcc.add_argument("--auto-file-edges", action="store_true",
+                       help="register cross-confirmed clusters as edge_cases "
+                            "in db_a (skips ones already filed for the same "
+                            "target_op + template_id)")
+    p_pcc.add_argument("--fail-on-bugs", action="store_true",
+                       help="exit non-zero if any cross-confirmed bugs exist "
+                            "(for CI gates)")
+
     # ---- stress: single-machine GPU correctness loop ----
     p_stress = sub.add_parser(
         "stress",
@@ -8237,6 +8430,8 @@ def main():
         return _cmd_probe_stats(args)
     if args.cmd == "probe-mine":
         return _cmd_probe_mine(args)
+    if args.cmd == "probe-cross-confirm":
+        return _cmd_probe_cross_confirm(args)
     if args.cmd == "probe-query":
         return _cmd_probe_query(args)
     if args.cmd == "probe-survey":
