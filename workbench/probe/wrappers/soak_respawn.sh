@@ -37,7 +37,7 @@ while true; do
         --soak \
         --budget 14400 \
         --max-probes 100000000 \
-        --workers 4 \
+        --workers "${MOWER_WORKERS:-8}" \
         "$@" \
         >> "$LOG_FILE" 2>&1
     EXITCODE=$?
@@ -51,6 +51,16 @@ while true; do
         continue
     fi
 
+    if [[ $EXITCODE -eq 0 ]]; then
+        # Budget exhausted but soak completed cleanly.  In 24/7 mode
+        # we restart with a fresh round so coverage keeps expanding.
+        echo "[supervisor] clean budget-exhaust (code 0); restarting for next round in 30s" >> "$LOG_FILE"
+        RESPAWN_COUNT=$((RESPAWN_COUNT + 1))
+        sleep 30
+        continue
+    fi
+
+    # Real error: stop the supervisor so the operator notices.
     echo "[supervisor] terminal exit code $EXITCODE; supervisor done" >> "$LOG_FILE"
     exit $EXITCODE
 done
