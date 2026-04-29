@@ -4894,6 +4894,404 @@ def _cmd_probe_survey(args):
     return 0
 
 
+def _cmd_probe_install_hook(args):
+    """Install the pre-commit hook into a target git repo."""
+    from pathlib import Path
+    import shutil
+    src = Path(__file__).parent / "probe" / "hooks" / "pre-commit"
+    if not src.exists():
+        print(f"hook source not found at {src}", file=sys.stderr)
+        return 1
+    repo = Path(args.repo)
+    if not (repo / ".git").exists():
+        print(f"{repo} is not a git repo", file=sys.stderr)
+        return 1
+    dst = repo / ".git" / "hooks" / "pre-commit"
+    if dst.exists() and not args.force:
+        print(f"{dst} already exists.  --force to overwrite.", file=sys.stderr)
+        return 1
+    shutil.copy(src, dst)
+    try:
+        dst.chmod(0o755)
+    except Exception:
+        pass
+    print(f"installed pre-commit hook → {dst}")
+    print("  set PROBE_PRECOMMIT_SKIP=1 to bypass on a single commit")
+    return 0
+
+
+def _cmd_probe_snapshot(args):
+    """Save a surface-coverage snapshot to the DB.  Run after each
+    significant change to track coverage over time.  Use
+    `probe-snapshot list` to see history."""
+    from workbench.probe import ProbeDB
+    from workbench.probe.surface import survey, encoder_audit
+    import os.path as _osp
+    import subprocess
+
+    db = ProbeDB(args.probe_dir)
+    if args.action == "list":
+        rows = db.list_surface_snapshots(limit=args.limit)
+        if not rows:
+            print("(no snapshots)")
+            db.close()
+            return 0
+        print(f"{'#':>4}  ts                   git_sha    "
+              f"ptx_targ  ptx_exer  enc_cov  sass_seen  notes")
+        for r in rows:
+            snap_id, ts, sha, total, targ, exer, etot, ecov, sopc, notes = r
+            sha_short = (sha or "-")[:8]
+            n = (notes or "")[:32]
+            print(f"{snap_id:>4}  {ts:<19s}  {sha_short:<8s}  "
+                  f"{targ:>4d}/{total:<3d}  "
+                  f"{exer:>4d}/{total:<3d}  "
+                  f"{ecov:>4d}/{etot:<3d}  "
+                  f"{sopc:>5d}    {n}")
+        db.close()
+        return 0
+
+    # action == "save" (default)
+    isel = args.isel_path or _osp.expandvars(
+        r"C:\Users\kraken\openptxas\sass\isel.py")
+    rep = survey(db, isel)
+    enc = encoder_audit(db)
+    sha = None
+    try:
+        sha = subprocess.check_output(
+            ["git", "-C", str(_osp.dirname(isel)), "rev-parse", "HEAD"],
+            text=True, timeout=5).strip()
+    except Exception:
+        pass
+    snap_id = db.add_surface_snapshot(
+        git_sha=sha,
+        ptx_cells_total=rep["ptx_surface"]["total_cells"],
+        ptx_cells_targeted=rep["ptx_surface"]["targeted_cells"],
+        ptx_cells_exercised=rep["ptx_surface"]["exercised_cells"],
+        encoders_total=enc["encoders_total"],
+        encoders_covered=len(enc["covered"]),
+        distinct_sass_opcodes=enc["seen_opcodes"][-1] if False
+            else len(set(o for _, o in enc["covered"])),
+        notes=args.notes,
+    )
+    print(f"snap_id={snap_id} saved.  "
+          f"ptx={rep['ptx_surface']['targeted_cells']}/"
+          f"{rep['ptx_surface']['total_cells']}  "
+          f"enc={len(enc['covered'])}/{enc['encoders_total']}")
+    db.close()
+    return 0
+
+
+def _cmd_probe_digest(args):
+    """Generate a one-page markdown digest of the probe DB state.
+    Run after a soak completes for a quick at-a-glance summary."""
+    from workbench.probe import ProbeDB
+    db = ProbeDB(args.probe_dir)
+    stats = db.stats()
+
+    # Edge case status counts
+    ec_status = dict(db.conn.execute(
+        "SELECT status, COUNT(*) FROM edge_cases GROUP BY status").fetchall())
+    # Coverage
+    cov = db.coverage_summary()
+    # Bug clusters
+    clusters = db.query("""
+        SELECT template_id, target_op,
+               printf('0x%03x', target_opcode), COUNT(*)
+        FROM probes
+        WHERE gpu_correct = 0 AND error IS NULL
+        GROUP BY template_id, target_op, target_opcode
+        ORDER BY COUNT(*) DESC
+        LIMIT 20
+    """)
+    # PSIRT bait count
+    psirt_n = db.conn.execute("""
+        SELECT COUNT(*) FROM probes
+        WHERE target_byte_match=1 AND gpu_correct=0 AND error IS NULL
+    """).fetchone()[0]
+    # Latest snapshot
+    latest_snap = db.list_surface_snapshots(limit=1)
+    snap = latest_snap[0] if latest_snap else None
+
+    out = []
+    out.append("# Probe DB Digest\n")
+    out.append(f"_generated_: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+    out.append(f"_db_: `{db.db_path}`\n")
+    out.append("")
+    out.append("## Probes")
+    out.append(f"- total: {stats['total']}")
+    out.append(f"- gpu_correct: {stats['correct']}")
+    out.append(f"- gpu_incorrect: {stats['incorrect']}")
+    out.append(f"- errors: {stats['errors']}")
+    out.append(f"- byte_match: {stats['byte_matches']}")
+    out.append("")
+    if snap:
+        out.append("## Latest surface snapshot")
+        out.append(f"- ts: {snap[1]}")
+        out.append(f"- ptx targeted: {snap[4]} / {snap[3]}")
+        out.append(f"- encoders covered: {snap[7]} / {snap[6]}")
+        out.append("")
+    out.append("## Coverage by axis")
+    for axis, filled, total in cov:
+        pct = 100 * filled / total if total else 0
+        out.append(f"- {axis}: {filled}/{total} ({pct:.0f}%)")
+    out.append("")
+    out.append("## Bug clusters (gpu_incorrect, no error)")
+    if not clusters:
+        out.append("- (none — clean)")
+    else:
+        for tpl, op, opc, n in clusters:
+            out.append(f"- {n:>4}× {op} ({tpl}) {opc}")
+    out.append("")
+    out.append("## PSIRT bait (ours==ptxas, hw wrong)")
+    out.append(f"- count: {psirt_n}")
+    out.append("")
+    out.append("## Edge cases")
+    if not ec_status:
+        out.append("- (none parked)")
+    else:
+        for k, v in sorted(ec_status.items()):
+            out.append(f"- {k}: {v}")
+
+    md = "\n".join(out)
+    if args.out:
+        from pathlib import Path
+        Path(args.out).write_text(md, encoding="utf-8")
+        print(f"wrote digest to {args.out}")
+    else:
+        print(md)
+    db.close()
+    return 0
+
+
+def _cmd_probe_psirt_bait(args):
+    """Auto-package PSIRT-submission drafts for all (byte_match=1,
+    gpu_correct=0) probes — ours emitted identical bytes to ptxas, hw
+    disagrees, the strongest hardware-bug signal we have."""
+    from workbench.probe import ProbeDB
+    from pathlib import Path
+    import json
+    db = ProbeDB(args.probe_dir)
+    rows = db.query("""
+        SELECT probe_id, ts, target_op, template_id, operand_spec,
+               ptx_sha, ours_cubin_sha, ptxas_cubin_sha,
+               target_ours_raw, target_ptxas_raw, target_opcode,
+               ptxas_version, sm_version, runner_host
+        FROM probes
+        WHERE target_byte_match = 1 AND gpu_correct = 0 AND error IS NULL
+        ORDER BY probe_id
+    """)
+    if not rows:
+        print("no PSIRT-bait probes (clean — no hardware-bug signals)")
+        db.close()
+        return 0
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"packaging {len(rows)} PSIRT-bait probes into {out_dir}")
+
+    for row in rows:
+        (probe_id, ts, target_op, tpl, op_spec, ptx_sha, ours_sha,
+         ptxas_sha, ours_raw, ptxas_raw, opcode, ptxas_ver, sm_ver,
+         host) = row
+        d = out_dir / f"probe_{probe_id:06d}_{target_op.replace('.', '_')}"
+        d.mkdir(parents=True, exist_ok=True)
+
+        # PTX
+        ptx = db.get_ptx(ptx_sha)
+        if ptx:
+            (d / "repro.ptx").write_text(ptx, encoding="utf-8")
+        # Both cubins
+        ours_cubin = db.get_cubin(ours_sha) if ours_sha else None
+        if ours_cubin:
+            (d / "ours.cubin").write_bytes(ours_cubin)
+        ptxas_cubin = db.get_cubin(ptxas_sha) if ptxas_sha else None
+        if ptxas_cubin:
+            (d / "ptxas.cubin").write_bytes(ptxas_cubin)
+
+        # Auto-generated report (markdown)
+        rpt = []
+        rpt.append(f"# PSIRT bait — probe_{probe_id}")
+        rpt.append("")
+        rpt.append(f"**Target op**: `{target_op}`  "
+                   f"**SASS opcode**: `0x{opcode:03x}`  "
+                   f"**SM**: `sm_{sm_ver}`")
+        rpt.append(f"**Discovered**: {ts} on {host}")
+        rpt.append(f"**ptxas version**: {ptxas_ver or '(unknown)'}")
+        rpt.append("")
+        rpt.append("## What's the bug")
+        rpt.append("")
+        rpt.append("The openptxas compiler and NVIDIA's `ptxas` produce "
+                   "byte-identical SASS for this probe.  The compiled "
+                   "kernel runs on the GPU with N=128 threads.  For some "
+                   "thread IDs, the GPU produces output that disagrees "
+                   "with PTX semantics.  Both compilers agree on the "
+                   "instruction; the hardware is the disagreeing party.")
+        rpt.append("")
+        rpt.append("## Reproducer")
+        rpt.append("")
+        rpt.append("```ptx")
+        if ptx: rpt.append(ptx.strip())
+        rpt.append("```")
+        rpt.append("")
+        rpt.append(f"Operand spec (JSON): `{op_spec}`")
+        rpt.append("")
+        rpt.append("## Target instruction (16 bytes, identical in both compilers)")
+        rpt.append("")
+        if ours_raw:
+            rpt.append(f"`{ours_raw.hex()}`")
+            rpt.append("")
+            rpt.append("Decode:")
+            rpt.append(f"- bytes[0:2] = opcode `0x{opcode:03x}`")
+            rpt.append(f"- byte 2 (dest) = `0x{ours_raw[2]:02x}`")
+            rpt.append(f"- byte 3 (src0) = `0x{ours_raw[3]:02x}`")
+            rpt.append(f"- byte 4 (src1/imm) = `0x{ours_raw[4]:02x}`")
+            rpt.append(f"- byte 8 (src2) = `0x{ours_raw[8]:02x}`")
+            rpt.append(f"- ctrl bytes 13-15 = "
+                       f"`{ours_raw[13]:02x} {ours_raw[14]:02x} {ours_raw[15]:02x}`")
+        rpt.append("")
+        rpt.append("## Files in this directory")
+        rpt.append("")
+        rpt.append("- `repro.ptx` — the reproducer kernel")
+        rpt.append("- `ours.cubin` — openptxas-compiled cubin")
+        rpt.append("- `ptxas.cubin` — ptxas-compiled cubin")
+        rpt.append("- `report.md` — this file")
+        rpt.append("")
+        rpt.append("## Severity")
+        rpt.append("")
+        rpt.append("Hardware miscompute — silent wrong-result.  No crash, "
+                   "no error reporting from the driver.  Severity depends "
+                   "on which thread positions exhibit the bug and how "
+                   "often the affected instruction appears in real code.")
+        (d / "report.md").write_text("\n".join(rpt), encoding="utf-8")
+
+    print(f"  wrote {len(rows)} drafts to {out_dir}")
+    db.close()
+    return 0
+
+
+def _cmd_probe_kb(args):
+    """Knowledge-base for fixed bugs — search past fixes by pattern."""
+    from workbench.probe import ProbeDB
+    db = ProbeDB(args.probe_dir)
+    if args.action == "list":
+        rows = list(db.conn.execute(
+            "SELECT * FROM fix_history ORDER BY fixed_at DESC LIMIT ?",
+            (args.limit,)))
+        for r in rows:
+            print(f"#{r[0]}  {r[1]}  tag={r[3] or '-'}  "
+                  f"sha={r[4][:8] if r[4] else '-'}  "
+                  f"{r[5] or ''}")
+        db.close()
+        return 0
+    if args.action == "search":
+        rows = db.search_fixes(args.query or "")
+        for r in rows:
+            print(f"#{r[0]}  {r[1]}  tag={r[3] or '-'}  "
+                  f"sha={r[4][:8] if r[4] else '-'}")
+            print(f"     pattern: {r[2]}")
+            if r[5]: print(f"     summary: {r[5]}")
+            print()
+        db.close()
+        return 0
+    if args.action == "add":
+        if not args.bug_pattern:
+            print("kb add: --bug-pattern required", file=sys.stderr)
+            return 2
+        fid = db.add_fix(
+            bug_pattern=args.bug_pattern,
+            related_bug_tag=args.related_bug,
+            fix_commit_sha=args.commit,
+            fix_summary=args.summary,
+            repro_probe_id=args.repro_probe_id,
+            target_op=args.target_op,
+            notes=args.notes,
+        )
+        print(f"added fix_id={fid}")
+        db.close()
+        return 0
+    print(f"unknown action: {args.action}", file=sys.stderr)
+    db.close()
+    return 2
+
+
+def _cmd_probe_bisect(args):
+    """Auto-bisect a regression: given a failing probe_id, find the
+    git commit where it started failing.  Wraps `git bisect run`."""
+    from workbench.probe import ProbeDB
+    from pathlib import Path
+    import json
+    import subprocess
+    db = ProbeDB(args.probe_dir)
+    rows = db.query(
+        "SELECT template_id, target_op, operand_spec FROM probes "
+        "WHERE probe_id = ?", (args.probe_id,))
+    if not rows:
+        print(f"probe_id={args.probe_id} not found", file=sys.stderr)
+        return 1
+    tpl, target_op, op_spec = rows[0]
+    db.close()
+
+    # Write a tiny bisect-runner script that compiles + runs the spec
+    # and exits 0 if probe passes, 1 if fails, 125 if can't test.
+    bisect_script = Path(args.bisect_script
+                         or "/tmp/probe_bisect_runner.sh")
+    bisect_script.parent.mkdir(parents=True, exist_ok=True)
+    runner_py = f'''
+import sys, json
+sys.path.insert(0, r"{args.workbench_path or 'C:/Users/kraken/forge-workbench'}")
+from workbench.probe.generator import ProbeSpec
+from workbench.probe.runner import compile_probe, run_compiled, _run_cubin
+from workbench.probe.db import ProbeDB
+from benchmarks.bench_util import compile_openptxas, compile_ptxas, CUDAContext
+spec = ProbeSpec(template_id="{tpl}", target_op="{target_op}",
+                 operand_spec=json.loads({json.dumps(op_spec)!r}))
+ctx = CUDAContext()
+res = compile_probe(spec)
+if res["error"]:
+    print(f"COMPILE-ERR: {{res['error']}}", file=sys.stderr)
+    sys.exit(125)
+import struct
+extra = spec.template_id in ("load_consume",)
+ours_out = _run_cubin(ctx, res["ours_cubin"], extra_buf=extra)
+ptxas_out = _run_cubin(ctx, res["ptxas_cubin"], extra_buf=extra)
+ok = (ours_out is not None and ours_out == ptxas_out)
+ctx.close()
+sys.exit(0 if ok else 1)
+'''
+    runner_path = Path(str(bisect_script) + ".py")
+    runner_path.write_text(runner_py)
+    bisect_script.write_text(
+        f"#!/bin/sh\npython {runner_path}\n", encoding="utf-8")
+    try:
+        bisect_script.chmod(0o755)
+    except Exception:
+        pass
+
+    print(f"probe_id={args.probe_id} — running git bisect")
+    print(f"  good: {args.good}")
+    print(f"  bad:  {args.bad or 'HEAD'}")
+    print(f"  runner: {runner_path}")
+    print()
+    print(f"To run manually:")
+    print(f"  git -C {args.repo} bisect start {args.bad or 'HEAD'} {args.good}")
+    print(f"  git -C {args.repo} bisect run sh {bisect_script}")
+    print()
+    if args.run:
+        try:
+            subprocess.check_call(
+                ["git", "-C", args.repo, "bisect", "start",
+                 args.bad or "HEAD", args.good])
+            r = subprocess.run(
+                ["git", "-C", args.repo, "bisect", "run", "sh",
+                 str(bisect_script)],
+                check=False)
+            print(f"bisect exit={r.returncode}")
+        finally:
+            subprocess.run(["git", "-C", args.repo, "bisect", "reset"],
+                           check=False)
+    return 0
+
+
 def _cmd_probe_encoder_audit(args):
     """List every encode_* function in our SASS encoder modules and
     cross-reference with opcodes the probes have actually emitted.
@@ -7427,6 +7825,82 @@ def main():
     p_pm2.add_argument("--rule", default=None,
                        help="run a single rule by name (default: all)")
 
+    # ---- probe-install-hook: install git pre-commit hook ----
+    p_pih = sub.add_parser(
+        "probe-install-hook",
+        help="install the regression-axis pre-commit hook in a git repo")
+    p_pih.add_argument("--repo", required=True,
+                       help="path to the git repo to install into")
+    p_pih.add_argument("--force", action="store_true",
+                       help="overwrite existing hook")
+
+    # ---- probe-snapshot: surface coverage delta over time ----
+    p_psn = sub.add_parser(
+        "probe-snapshot",
+        help="save / list surface-coverage snapshots over time")
+    p_psn.add_argument("--probe-dir", default=str(DEFAULT_PROBE_DIR))
+    p_psn.add_argument("action", choices=["save", "list"], default="save", nargs="?")
+    p_psn.add_argument("--isel-path", default=None)
+    p_psn.add_argument("--limit", type=int, default=20)
+    p_psn.add_argument("--notes", default=None)
+
+    # ---- probe-digest: one-page markdown digest ----
+    p_pdig = sub.add_parser(
+        "probe-digest",
+        help="generate a one-page digest of the probe DB state")
+    p_pdig.add_argument("--probe-dir", default=str(DEFAULT_PROBE_DIR))
+    p_pdig.add_argument("--out", default=None,
+                        help="write to file (default: stdout)")
+
+    # ---- probe-psirt-bait: auto-package PSIRT submissions ----
+    p_ppb = sub.add_parser(
+        "probe-psirt-bait",
+        help="auto-package PSIRT-bait probes into submission drafts",
+        description="Probes where ours emitted IDENTICAL bytes to ptxas "
+                    "BUT GPU output is wrong (hardware disagrees with both "
+                    "compilers).  Strongest signal we have for hardware "
+                    "bugs.  This command writes a draft directory per "
+                    "probe with PTX, both cubins, and an auto-generated "
+                    "report ready for PSIRT submission.")
+    p_ppb.add_argument("--probe-dir", default=str(DEFAULT_PROBE_DIR))
+    p_ppb.add_argument("--out-dir", default="psirt_drafts",
+                       help="output directory (default: ./psirt_drafts)")
+
+    # ---- probe-kb: fix-history knowledge base ----
+    p_pkb = sub.add_parser(
+        "probe-kb",
+        help="search/add fix history (knowledge base)")
+    p_pkb.add_argument("--probe-dir", default=str(DEFAULT_PROBE_DIR))
+    p_pkb.add_argument("action", choices=["list", "search", "add"])
+    p_pkb.add_argument("--query", default=None)
+    p_pkb.add_argument("--limit", type=int, default=50)
+    p_pkb.add_argument("--bug-pattern", default=None)
+    p_pkb.add_argument("--related-bug", default=None)
+    p_pkb.add_argument("--commit", default=None)
+    p_pkb.add_argument("--summary", default=None)
+    p_pkb.add_argument("--repro-probe-id", type=int, default=None)
+    p_pkb.add_argument("--target-op", default=None)
+    p_pkb.add_argument("--notes", default=None)
+
+    # ---- probe-bisect: auto git-bisect a regression ----
+    p_pbs = sub.add_parser(
+        "probe-bisect",
+        help="auto-bisect a failing probe_id back to the breaking commit")
+    p_pbs.add_argument("--probe-dir", default=str(DEFAULT_PROBE_DIR))
+    p_pbs.add_argument("probe_id", type=int)
+    p_pbs.add_argument("--good", required=True,
+                       help="known-good git ref (e.g. HEAD~50)")
+    p_pbs.add_argument("--bad", default=None,
+                       help="known-bad ref (default: HEAD)")
+    p_pbs.add_argument("--repo", default=r"C:\Users\kraken\openptxas",
+                       help="git repo to bisect in")
+    p_pbs.add_argument("--workbench-path",
+                       default=r"C:\Users\kraken\forge-workbench")
+    p_pbs.add_argument("--bisect-script", default=None)
+    p_pbs.add_argument("--run", action="store_true",
+                       help="actually invoke `git bisect run` "
+                            "(default: print commands only)")
+
     # ---- probe-encoder-audit: SASS encoder catalog vs emitted opcodes ----
     p_pea = sub.add_parser(
         "probe-encoder-audit",
@@ -7689,6 +8163,18 @@ def main():
         return _cmd_probe_determinism(args)
     if args.cmd == "probe-encoder-audit":
         return _cmd_probe_encoder_audit(args)
+    if args.cmd == "probe-snapshot":
+        return _cmd_probe_snapshot(args)
+    if args.cmd == "probe-digest":
+        return _cmd_probe_digest(args)
+    if args.cmd == "probe-psirt-bait":
+        return _cmd_probe_psirt_bait(args)
+    if args.cmd == "probe-kb":
+        return _cmd_probe_kb(args)
+    if args.cmd == "probe-bisect":
+        return _cmd_probe_bisect(args)
+    if args.cmd == "probe-install-hook":
+        return _cmd_probe_install_hook(args)
     if args.cmd == "encode-fuzz":
         return _cmd_encode_fuzz(args)
     if args.cmd == "leaderboard":

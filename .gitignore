@@ -12,6 +12,9 @@ results/
 stress_runs/
 _fuzz/
 
+# Probe DB and cached cubins — content-addressed binaries don't belong in git
+probes/
+
 # Local scratch
 _tmp_*
 *.cubin

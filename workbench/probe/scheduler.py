@@ -179,6 +179,24 @@ def probe_loop(db: ProbeDB,
             if gc == 1: n_correct += 1
             if bm == 0: n_byte_diff += 1
             if gc == 0: n_incorrect += 1
+            # Auto-resolve detection: if this probe came from the
+            # regression axis AND it just passed, flag the corresponding
+            # edge_case as resolved-pending-confirm.  Doesn't change the
+            # status of edge cases that are still failing (would-be no-op).
+            if axis == "regression" and gc == 1 and bin_key.startswith("edge_"):
+                try:
+                    eid = int(bin_key.split("_")[1])
+                    cur = db.conn.execute(
+                        "SELECT status FROM edge_cases WHERE edge_id = ?", (eid,))
+                    res = cur.fetchone()
+                    if res and res[0] == "open":
+                        db.update_edge_case(
+                            eid, status="resolved-pending-confirm",
+                            notes=(f"Regression probe {probe_id} passed at "
+                                   f"{time.strftime('%Y-%m-%dT%H:%M:%S')} — "
+                                   f"verify and close."))
+                except (ValueError, IndexError, Exception):
+                    pass
         if progress_cb and n % 25 == 0:
             progress_cb(n, axis, bin_key)
 

@@ -114,6 +114,39 @@ CREATE INDEX IF NOT EXISTS ix_edge_status ON edge_cases(status);
 CREATE INDEX IF NOT EXISTS ix_edge_category ON edge_cases(category);
 CREATE INDEX IF NOT EXISTS ix_edge_op ON edge_cases(target_op);
 
+-- Surface-coverage snapshots over time.  Records the survey state
+-- (PTX cells covered, encoder coverage, distinct opcodes seen) at a
+-- point in time so we can detect regressions or measure progress.
+CREATE TABLE IF NOT EXISTS surface_snapshots (
+    snap_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts               TEXT NOT NULL,
+    git_sha          TEXT,
+    ptx_cells_total  INTEGER,
+    ptx_cells_targeted   INTEGER,
+    ptx_cells_exercised  INTEGER,
+    encoders_total       INTEGER,
+    encoders_covered     INTEGER,
+    distinct_sass_opcodes INTEGER,
+    notes            TEXT
+);
+
+-- Fix-history knowledge base.  When a bug is fixed, we record the
+-- pattern + the fix's git sha + the regression probe.  Future bugs
+-- can search this for similar patterns.
+CREATE TABLE IF NOT EXISTS fix_history (
+    fix_id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    fixed_at         TEXT NOT NULL,
+    bug_pattern      TEXT NOT NULL,    -- free-text "what shape of bug"
+    related_bug_tag  TEXT,             -- e.g., "FG29-multi-body-reg"
+    fix_commit_sha   TEXT,             -- git sha of the fix
+    fix_summary      TEXT,             -- one-line summary
+    repro_probe_id   INTEGER,          -- regression probe id
+    target_op        TEXT,
+    notes            TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_fix_pattern ON fix_history(bug_pattern);
+CREATE INDEX IF NOT EXISTS ix_fix_tag ON fix_history(related_bug_tag);
+
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT
@@ -313,6 +346,61 @@ class ProbeDB:
         self.conn.execute(f"UPDATE edge_cases SET {sets} WHERE edge_id = ?",
                           params)
         self.conn.commit()
+
+    # ---- surface snapshots ----
+
+    def add_surface_snapshot(self, *, git_sha: str | None,
+                             ptx_cells_total: int,
+                             ptx_cells_targeted: int,
+                             ptx_cells_exercised: int,
+                             encoders_total: int,
+                             encoders_covered: int,
+                             distinct_sass_opcodes: int,
+                             notes: str | None = None) -> int:
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+        cur = self.conn.execute("""
+            INSERT INTO surface_snapshots (
+                ts, git_sha, ptx_cells_total, ptx_cells_targeted,
+                ptx_cells_exercised, encoders_total, encoders_covered,
+                distinct_sass_opcodes, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (ts, git_sha, ptx_cells_total, ptx_cells_targeted,
+              ptx_cells_exercised, encoders_total, encoders_covered,
+              distinct_sass_opcodes, notes))
+        self.conn.commit()
+        return cur.lastrowid
+
+    def list_surface_snapshots(self, limit: int = 50) -> list[tuple]:
+        return list(self.conn.execute("""
+            SELECT * FROM surface_snapshots
+            ORDER BY snap_id DESC LIMIT ?
+        """, (limit,)))
+
+    # ---- fix history ----
+
+    def add_fix(self, *, bug_pattern: str, related_bug_tag: str | None = None,
+                fix_commit_sha: str | None = None, fix_summary: str | None = None,
+                repro_probe_id: int | None = None, target_op: str | None = None,
+                notes: str | None = None) -> int:
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+        cur = self.conn.execute("""
+            INSERT INTO fix_history (
+                fixed_at, bug_pattern, related_bug_tag, fix_commit_sha,
+                fix_summary, repro_probe_id, target_op, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (ts, bug_pattern, related_bug_tag, fix_commit_sha,
+              fix_summary, repro_probe_id, target_op, notes))
+        self.conn.commit()
+        return cur.lastrowid
+
+    def search_fixes(self, query: str) -> list[tuple]:
+        q = f"%{query}%"
+        return list(self.conn.execute("""
+            SELECT * FROM fix_history
+            WHERE bug_pattern LIKE ? OR related_bug_tag LIKE ?
+                  OR fix_summary LIKE ? OR target_op LIKE ?
+            ORDER BY fixed_at DESC
+        """, (q, q, q, q)))
 
     def close(self) -> None:
         self.conn.close()

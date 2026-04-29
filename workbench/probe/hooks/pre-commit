@@ -1,0 +1,47 @@
+#!/bin/sh
+# Probe mower pre-commit hook.  Runs only the regression axis (parked
+# edge cases + permanent regression seeds).  Fast — typically <30s.
+#
+# To install:
+#   cp workbench/probe/hooks/pre-commit .git/hooks/pre-commit
+#   chmod +x .git/hooks/pre-commit
+# Or via CLI:
+#   python -m workbench probe-install-hook --repo .
+
+set -e
+
+# Skip if PROBE_PRECOMMIT_SKIP is set (escape hatch).
+if [ -n "$PROBE_PRECOMMIT_SKIP" ]; then
+    echo "pre-commit: skipped (PROBE_PRECOMMIT_SKIP set)"
+    exit 0
+fi
+
+# Find a python interpreter and forge-workbench path.
+WORKBENCH="${FORGE_WORKBENCH:-$HOME/forge-workbench}"
+if [ ! -d "$WORKBENCH" ]; then
+    WORKBENCH="C:/Users/kraken/forge-workbench"
+fi
+
+PYTHON="${PYTHON:-python}"
+
+cd "$WORKBENCH"
+
+echo "pre-commit: running probe regression axis..."
+PYTHONIOENCODING=utf-8 "$PYTHON" -m workbench probe-loop \
+    --axes regression \
+    --max-probes 50 \
+    --budget 60 \
+    > /tmp/probe_precommit.log 2>&1
+
+if grep -q "gpu_incorrect=0" /tmp/probe_precommit.log; then
+    echo "pre-commit: regression axis clean ✓"
+    exit 0
+else
+    echo "pre-commit: regression axis surfaced new failures!"
+    echo "--- log tail ---"
+    tail -20 /tmp/probe_precommit.log
+    echo
+    echo "If this is intentional (you're updating an edge case), set "
+    echo "PROBE_PRECOMMIT_SKIP=1 to bypass."
+    exit 1
+fi

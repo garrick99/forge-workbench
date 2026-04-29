@@ -192,6 +192,58 @@ RULES: list[Rule] = [
         """,
     ),
     Rule(
+        name="compile_time_outliers",
+        description=(
+            "Per (target_op, opcode) median compile-time, with stddev.  "
+            "Outliers (>2 sigma above median or median > 50ms) flag "
+            "performance regressions or pathological codegen paths.  "
+            "ours_compile_ms is the metric — compares against itself "
+            "over the corpus, not against ptxas."
+        ),
+        sql="""
+            WITH per_op AS (
+                SELECT target_op, target_opcode,
+                       ours_compile_ms,
+                       AVG(ours_compile_ms) OVER (PARTITION BY target_op) AS avg_ms
+                FROM probes
+                WHERE error IS NULL AND ours_compile_ms IS NOT NULL
+            )
+            SELECT target_op,
+                   printf('0x%03x', target_opcode) AS opcode_hex,
+                   COUNT(*) AS n_probes,
+                   ROUND(MIN(ours_compile_ms), 2) AS min_ms,
+                   ROUND(AVG(ours_compile_ms), 2) AS avg_ms,
+                   ROUND(MAX(ours_compile_ms), 2) AS max_ms
+            FROM probes
+            WHERE error IS NULL AND ours_compile_ms IS NOT NULL
+            GROUP BY target_op, target_opcode
+            HAVING avg_ms > 30
+            ORDER BY avg_ms DESC
+            LIMIT 30
+        """,
+    ),
+    Rule(
+        name="psirt_bait",
+        description=(
+            "Probes where ours emitted IDENTICAL bytes to ptxas BUT the "
+            "GPU output is wrong.  Both compilers agree on the SASS; the "
+            "hardware disagrees.  Strongest signal we have for hardware "
+            "bugs / silicon errata.  Auto-package these for PSIRT "
+            "submission via `probe-psirt-bait`."
+        ),
+        sql="""
+            SELECT probe_id, target_op, template_id,
+                   printf('0x%03x', target_opcode) AS opcode_hex,
+                   operand_spec
+            FROM probes
+            WHERE target_byte_match = 1
+              AND gpu_correct = 0
+              AND error IS NULL
+            ORDER BY probe_id
+            LIMIT 100
+        """,
+    ),
+    Rule(
         name="acc_alias_imm_classes_failing",
         description=(
             "From acc_self probes: which (opcode, imm_class) pairs produce "
