@@ -25,6 +25,14 @@
 
 $ErrorActionPreference = 'Continue'
 
+# Force UTF-8 for native-command stdout/stderr capture.  Without this,
+# PowerShell's `*>>` redirect writes the python output as UTF-16 LE,
+# which interleaves with the supervisor's own UTF-8 lines (written via
+# Out-File -Encoding utf8) and produces a log file that can't be
+# grep'd cleanly.  Match $env:PYTHONIOENCODING set below.
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+
 # ---- Configuration with sensible defaults for the GreenDragon mower ----
 $ProbeDir   = if ($env:MOWER_PROBE_DIR)  { $env:MOWER_PROBE_DIR }  else { 'C:\mower\probes_long' }
 $LogDir     = if ($env:MOWER_LOG_DIR)    { $env:MOWER_LOG_DIR }    else { 'C:\mower\logs' }
