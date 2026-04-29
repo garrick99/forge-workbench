@@ -75,11 +75,14 @@ while ($true) {
         '--workers', $Workers
     )
 
-    # `2>&1 | Add-Content` merges stderr+stdout, then appends to the
-    # log.  Native commands' exit codes land in $LASTEXITCODE.  Out-File
-    # -Append is also fine but Add-Content is friendlier with text
-    # streaming from a long-running process.
-    & python @args 2>&1 | ForEach-Object { $_ | Out-File -FilePath $log -Append -Encoding utf8 }
+    # IMPORTANT: do NOT pipe through ForEach-Object / Out-File.  PowerShell
+    # pipelines clobber $LASTEXITCODE — the native python's actual exit
+    # code is masked by the pipeline-tail cmdlet's success status, which
+    # is always 0.  Use `*>>` (all-streams append) to preserve the
+    # native exit code in $LASTEXITCODE.
+    # Bug: 2026-04-29 first respawn attempt — probe-loop returned 99 but
+    # the pipeline drained it to 0, so the supervisor never respawned.
+    & python @args *>> $log
     $code = $LASTEXITCODE
 
     "[supervisor] exit: $(Get-Date -Format 'o')  code=$code" |
