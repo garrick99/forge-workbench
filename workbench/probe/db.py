@@ -402,5 +402,104 @@ class ProbeDB:
             ORDER BY fixed_at DESC
         """, (q, q, q, q)))
 
+    # ---- live-resolve loop (for the running scanner) ----
+
+    def record_resolution(self, *, edge_id: int, commit_sha: str,
+                          summary: str | None = None,
+                          related_bug_tag: str | None = None,
+                          target_op: str | None = None) -> int:
+        """Record that a fix has been committed for `edge_id`.
+
+        Marks the edge case 'resolved-pending-verify' and writes a
+        fix_history row.  The running scanner picks this up on its
+        next polling tick: it re-runs the regression probe and, if
+        it passes, marks the edge case 'resolved' (status='verified'
+        in the corresponding fix_history row).  If the running
+        scanner is on stale code, verification fails and stays
+        pending — the next respawn (triggered by git-HEAD change)
+        re-verifies with the new code.
+        """
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+        # Store the verification target on the edge_case
+        self.conn.execute("""
+            UPDATE edge_cases
+            SET status = 'resolved-pending-verify',
+                notes  = COALESCE(notes, '') || ?
+            WHERE edge_id = ?
+        """, (f"\n[{ts}] resolution recorded @ {commit_sha[:8]}: {summary or ''}",
+              edge_id))
+        # Look up edge_case to enrich the fix_history row
+        cur = self.conn.execute(
+            "SELECT target_op, repro_probe_id FROM edge_cases WHERE edge_id = ?",
+            (edge_id,))
+        row = cur.fetchone()
+        if row:
+            target_op = target_op or row[0]
+            repro = row[1]
+        else:
+            repro = None
+        cur2 = self.conn.execute("""
+            INSERT INTO fix_history (
+                fixed_at, bug_pattern, related_bug_tag, fix_commit_sha,
+                fix_summary, repro_probe_id, target_op, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (ts, f"edge_{edge_id}", related_bug_tag, commit_sha,
+              summary, repro, target_op,
+              "pending-verify"))
+        self.conn.commit()
+        return cur2.lastrowid
+
+    def pending_resolutions(self) -> list[tuple]:
+        """Return edge_cases with status='resolved-pending-verify'.
+
+        Each row: (edge_id, target_op, template_id, operand_spec,
+                   repro_probe_id).  Caller re-runs the regression
+                   probe and calls mark_resolution_verified().
+        """
+        return list(self.conn.execute("""
+            SELECT edge_id, target_op, template_id, operand_spec, repro_probe_id
+            FROM edge_cases
+            WHERE status = 'resolved-pending-verify'
+        """))
+
+    def mark_resolution_verified(self, edge_id: int,
+                                 verifying_probe_id: int) -> None:
+        """Promote an edge_case from 'resolved-pending-verify' to
+        'resolved'.  Updates the latest fix_history row for this edge
+        case to record the verifying probe_id."""
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+        self.conn.execute("""
+            UPDATE edge_cases
+            SET status = 'resolved',
+                notes  = COALESCE(notes, '') || ?
+            WHERE edge_id = ?
+        """, (f"\n[{ts}] verified by probe #{verifying_probe_id}", edge_id))
+        # Update most-recent fix_history row for this edge
+        self.conn.execute("""
+            UPDATE fix_history
+            SET notes = ?
+            WHERE fix_id = (
+                SELECT fix_id FROM fix_history
+                WHERE bug_pattern = ?
+                ORDER BY fixed_at DESC LIMIT 1
+            )
+        """, (f"verified by probe #{verifying_probe_id} at {ts}",
+              f"edge_{edge_id}"))
+        self.conn.commit()
+
+    # ---- meta table ----
+
+    def get_meta(self, key: str) -> str | None:
+        cur = self.conn.execute("SELECT value FROM meta WHERE key = ?", (key,))
+        row = cur.fetchone()
+        return row[0] if row else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        self.conn.execute("""
+            INSERT INTO meta (key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """, (key, value))
+        self.conn.commit()
+
     def close(self) -> None:
         self.conn.close()

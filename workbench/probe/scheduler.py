@@ -11,7 +11,9 @@ Strategies:
 """
 from __future__ import annotations
 
+import json
 import random
+import subprocess
 import time
 from typing import Iterator, Optional
 
@@ -23,6 +25,40 @@ from .coverage import all_axis_bins, synthesize, AXES
 from .db import ProbeDB
 from .generator import ProbeSpec
 from .runner import run_probe, compile_probe, run_compiled
+
+
+# Exit code the scheduler returns to its supervisor when it detects an
+# openptxas code change (git HEAD moved since startup) or another
+# explicit respawn signal.  The wrapper script re-spawns on this code.
+RESPAWN_EXIT_CODE = 99
+
+
+def _git_head(repo_path: str) -> str | None:
+    """Return short git HEAD SHA for a repo path, or None on any error.
+    Cheap (~5ms); safe to call repeatedly from the probe loop."""
+    try:
+        out = subprocess.check_output(
+            ["git", "-C", repo_path, "rev-parse", "HEAD"],
+            stderr=subprocess.DEVNULL, timeout=5)
+        return out.decode("utf-8").strip()
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+            FileNotFoundError, OSError):
+        return None
+
+
+def _openptxas_repo_path() -> str | None:
+    """Best-effort: locate the openptxas repo whose code is loaded into
+    THIS Python process.  Used to detect HEAD changes that warrant
+    a respawn."""
+    try:
+        import sass  # openptxas top-level
+        f = getattr(sass, "__file__", None)
+        if not f:
+            return None
+        # sass/__init__.py → openptxas root is the parent of the parent
+        return str(os.path.dirname(os.path.dirname(os.path.abspath(f))))
+    except Exception:
+        return None
 
 
 # HARD CAP on parallel compile workers.  GPU stays single-context
@@ -168,9 +204,83 @@ def probe_loop(db: ProbeDB,
     n_incorrect = 0
     t_start = time.time()
 
+    # Live-resolve loop: record the git HEAD of openptxas at startup.
+    # The probe loop polls every RESPAWN_POLL_EVERY probes; if HEAD
+    # has moved (i.e. a fix landed since this scanner started), we
+    # exit gracefully so the supervisor can respawn against the new
+    # code.  Stored in meta so a downstream `probe-resolve` call has
+    # a reference point.
+    repo_path = _openptxas_repo_path()
+    startup_head = _git_head(repo_path) if repo_path else None
+    if startup_head:
+        db.set_meta("scanner_startup_commit", startup_head)
+        db.set_meta("scanner_startup_ts",
+                    time.strftime("%Y-%m-%dT%H:%M:%S"))
+        print(f"[scheduler] startup HEAD = {startup_head[:12]} "
+              f"(repo={repo_path})")
+    respawn_requested = False
+    RESPAWN_POLL_EVERY = 250    # check git HEAD + resolutions every N probes
+
     # Clamp workers to safe range.  >1 enables parallel compile; GPU
     # remains single-threaded (CUDAContext is not thread-safe).
     workers_clamped = max(1, min(MAX_WORKERS, int(workers)))
+
+    def _verify_pending_resolutions() -> int:
+        """Re-run regression probes for any edge_case currently in
+        'resolved-pending-verify' status.  Returns the number of
+        verifications performed (whether they passed or not).
+
+        Uses the IN-PROCESS openptxas code, so this only succeeds
+        for fixes that are reachable from the currently-loaded
+        modules.  Fixes in newer commits stay 'pending-verify' until
+        the supervisor respawns this scanner against the new code.
+        """
+        rows = db.pending_resolutions()
+        if not rows:
+            return 0
+        verified = 0
+        for edge_id, target_op, template_id, operand_spec, _ in rows:
+            if not (template_id and operand_spec):
+                continue
+            try:
+                opspec = json.loads(operand_spec)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            spec = ProbeSpec(template_id=template_id,
+                             target_op=target_op or "regression",
+                             operand_spec=opspec)
+            try:
+                pid = run_probe(spec, db, ctx=ctx, gpu=gpu)
+            except Exception as e:
+                print(f"[scheduler] resolution verify edge_{edge_id} "
+                      f"raised {type(e).__name__}: {e}")
+                continue
+            row = db.query("SELECT gpu_correct FROM probes WHERE probe_id = ?",
+                           (pid,))
+            if row and row[0][0] == 1:
+                db.mark_resolution_verified(edge_id, pid)
+                print(f"[scheduler] verified resolution: edge_{edge_id} "
+                      f"now resolved (probe #{pid})")
+                verified += 1
+            else:
+                # Stays pending-verify; will retry on respawn.
+                print(f"[scheduler] edge_{edge_id} still failing on current "
+                      f"code (probe #{pid}) — keeping pending-verify")
+        return verified
+
+    def _maybe_respawn() -> bool:
+        """If a code change has landed (git HEAD moved since startup)
+        return True.  Caller should treat the loop as done and have the
+        outer probe_loop signal the supervisor."""
+        nonlocal respawn_requested
+        if respawn_requested or not startup_head or not repo_path:
+            return respawn_requested
+        cur = _git_head(repo_path)
+        if cur and cur != startup_head:
+            print(f"[scheduler] git HEAD changed: {startup_head[:12]} -> "
+                  f"{cur[:12]} -- requesting respawn")
+            respawn_requested = True
+        return respawn_requested
 
     def _record(probe_id: int, axis: str, bin_key: str):
         nonlocal n, n_match, n_correct, n_byte_diff, n_incorrect
@@ -205,12 +315,19 @@ def probe_loop(db: ProbeDB,
                     pass
         if progress_cb and n % 25 == 0:
             progress_cb(n, axis, bin_key)
+        # Live-resolve pulse: check for newly-recorded resolutions and
+        # for git-HEAD changes.  Cheap; runs every RESPAWN_POLL_EVERY.
+        if n % RESPAWN_POLL_EVERY == 0:
+            _verify_pending_resolutions()
+            _maybe_respawn()
 
     def _drive_serial(it):
         for axis, bin_key, spec in it:
             if deadline and time.time() >= deadline:
                 return False
             if max_probes is not None and n >= max_probes:
+                return False
+            if respawn_requested:
                 return False
             probe_id = run_probe(spec, db, ctx=ctx, gpu=gpu)
             _record(probe_id, axis, bin_key)
@@ -232,6 +349,8 @@ def probe_loop(db: ProbeDB,
                 if deadline and time.time() >= deadline:
                     return False
                 if max_probes is not None and n >= max_probes:
+                    return False
+                if respawn_requested:
                     return False
                 batch.append((axis, bin_key, spec))
                 if len(batch) >= chunk:
@@ -284,4 +403,6 @@ def probe_loop(db: ProbeDB,
         "gpu_incorrect": n_incorrect,
         "elapsed_s": elapsed,
         "rate_per_s": n / max(elapsed, 1e-3),
+        "respawn_requested": respawn_requested,
+        "startup_commit": startup_head,
     }

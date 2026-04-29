@@ -4804,6 +4804,45 @@ def _cmd_probe_loop(args):
     print(f"    byte_match={stats['byte_match']}  byte_diff={stats['byte_diff']}")
     print(f"    gpu_correct={stats['gpu_correct']}  gpu_incorrect={stats['gpu_incorrect']}")
     db.close()
+    # Live-resolve loop: signal supervisor to respawn if openptxas
+    # HEAD changed during the run (a bug fix landed).  The wrapper
+    # script restarts us against the new code; the next scanner picks
+    # up the resolution and re-verifies in-place.
+    if stats.get("respawn_requested"):
+        from workbench.probe.scheduler import RESPAWN_EXIT_CODE
+        print(f"  [respawn] git HEAD moved from "
+              f"{stats.get('startup_commit', '?')[:12]} during the run; "
+              f"exiting with code {RESPAWN_EXIT_CODE} for supervisor respawn")
+        return RESPAWN_EXIT_CODE
+    return 0
+
+
+def _cmd_probe_resolve(args):
+    """Record that a fix has been committed for an edge_case.  The
+    running scanner picks this up on its next polling tick and
+    re-verifies against the regression probe.  If the scanner's
+    in-process openptxas code can already verify the fix, the edge
+    case is promoted to 'resolved' immediately.  If verification
+    fails (e.g. fix is in a newer commit not loaded by the running
+    scanner), it stays 'resolved-pending-verify' until the supervisor
+    respawns the scanner against the new code.
+    """
+    from workbench.probe import ProbeDB
+    db = ProbeDB(args.probe_dir)
+    fix_id = db.record_resolution(
+        edge_id=args.edge_id,
+        commit_sha=args.commit,
+        summary=args.summary,
+        related_bug_tag=args.tag,
+        target_op=args.target_op,
+    )
+    print(f"probe-resolve: edge_{args.edge_id} marked resolved-pending-verify")
+    print(f"  fix_id        = {fix_id}")
+    print(f"  commit_sha    = {args.commit}")
+    print(f"  summary       = {args.summary or '(none)'}")
+    print(f"  scanner will re-verify on next polling tick.")
+    print(f"  if HEAD has moved, scanner will gracefully exit for respawn.")
+    db.close()
     return 0
 
 
@@ -7826,6 +7865,33 @@ def main():
                     "errors; coverage breakdown per axis.")
     p_ps.add_argument("--probe-dir", default=str(DEFAULT_PROBE_DIR))
 
+    # ---- probe-resolve: record a fix for an edge case ----
+    p_pr_resolve = sub.add_parser(
+        "probe-resolve",
+        help="record that a fix has been committed for an edge case",
+        description="Mark an edge_case as 'resolved-pending-verify' and "
+                    "log the fix in fix_history.  The running probe-loop "
+                    "scanner picks this up on its next polling tick (every "
+                    "250 probes) and re-runs the regression probe.  If the "
+                    "fix is reachable from the running scanner's loaded "
+                    "openptxas modules, the edge case is promoted to "
+                    "'resolved' immediately.  Otherwise it stays "
+                    "'resolved-pending-verify' until the supervisor respawns "
+                    "the scanner against the new commit (which the scanner "
+                    "auto-detects via git HEAD watch).")
+    p_pr_resolve.add_argument("--probe-dir", default=str(DEFAULT_PROBE_DIR))
+    p_pr_resolve.add_argument("edge_id", type=int,
+                              help="edge_case.edge_id of the bug being resolved")
+    p_pr_resolve.add_argument("--commit", required=True,
+                              help="git SHA of the fix commit")
+    p_pr_resolve.add_argument("--summary",
+                              help="one-line fix summary (goes into fix_history)")
+    p_pr_resolve.add_argument("--tag",
+                              help="related_bug_tag (e.g. 'HMMA-scoreboard-wbar')")
+    p_pr_resolve.add_argument("--target-op",
+                              help="override target_op for fix_history "
+                                   "(default: pulled from edge_case)")
+
     # ---- probe-mine: run all rule queries ----
     p_pm2 = sub.add_parser(
         "probe-mine",
@@ -8165,6 +8231,8 @@ def main():
         return _cmd_probe_init(args)
     if args.cmd == "probe-loop":
         return _cmd_probe_loop(args)
+    if args.cmd == "probe-resolve":
+        return _cmd_probe_resolve(args)
     if args.cmd == "probe-stats":
         return _cmd_probe_stats(args)
     if args.cmd == "probe-mine":
