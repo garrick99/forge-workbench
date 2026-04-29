@@ -1045,7 +1045,70 @@ TEMPLATES: dict[str, tuple[Callable[[ProbeSpec], str],
     "hmma_m16n8k8":       (template_hmma_m16n8k8,       expected_hmma_m16n8k8),
     "hmma_bf16_m16n8k16": (template_hmma_bf16_m16n8k16, expected_hmma_bf16_m16n8k16),
     "hmma_tf32_m16n8k8":  (template_hmma_tf32_m16n8k8,  expected_hmma_tf32_m16n8k8),
+    "tma_commit_wait":    (None,                        None),  # filled in below
 }
+
+
+# ---------------------------------------------------------------------------
+# Template: tma_commit_wait
+#
+# Tensor Memory Accelerator (TMA) async-copy synchronization primitives.
+# This is the FIRST CUT of the TMA probe family — it exercises the
+# cheap standalone sync ops (no tensor descriptor / mbarrier setup
+# required, runs single-thread):
+#
+#   cp.async.bulk.commit_group  →  UTMACMDFLUSH (opcode 0x9b7)
+#   cp.async.bulk.wait_group N  →  DEPBAR.LE  SB0, N
+#
+# Verification path is byte-match against ptxas: there's no observable
+# GPU output so the oracle is structural (does our cubin match ptxas's,
+# does it compile clean, does the expected opcode appear in the SASS).
+#
+# Future TMA templates (tensor.1d/2d load/store) need:
+#   - a tensor-map kernel parameter (.param .u64 tma_desc)
+#   - host-side cuTensorMapEncodeTiled() in the runner
+#   - mbarrier.init / arrive_expect_tx / wait_parity for ordering
+# Tracked separately; this template lays the foundation.
+#
+#   operand_spec keys:
+#     wait_count : N for cp.async.bulk.wait_group N (default 0)
+#     n_commits  : how many commit_group invocations to chain
+#                  before the wait (default 1)
+# ---------------------------------------------------------------------------
+
+def template_tma_commit_wait(spec: ProbeSpec) -> str:
+    wait_count = spec.operand_spec.get("wait_count", 0)
+    n_commits = max(1, spec.operand_spec.get("n_commits", 1))
+    commits = "\n    ".join(["cp.async.bulk.commit_group;"] * n_commits)
+    return f""".version 9.0
+.target sm_120
+.address_size 64
+.visible .entry probe(.param .u64 p_out, .param .u32 n) {{
+    .reg .u32 %r<4>; .reg .u64 %rd<3>; .reg .pred %p0;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    {commits}
+    cp.async.bulk.wait_group {wait_count};
+    mov.u32 %r2, {0xCAFE + wait_count};
+    cvt.u64.u32 %rd1, %r0; shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r2;
+    ret;
+}}
+"""
+
+
+def expected_tma_commit_wait(spec: ProbeSpec, tid: int) -> int:
+    # The TMA sync ops have no observable side-effect on this kernel
+    # (no actual data transfer is in flight).  We tag the output with
+    # 0xCAFE + wait_count so different bins write distinguishable
+    # values, providing a baseline correctness check (kernel ran to
+    # completion, the post-sync mov + store landed).
+    return 0xCAFE + spec.operand_spec.get("wait_count", 0)
+
+
+TEMPLATES["tma_commit_wait"] = (template_tma_commit_wait, expected_tma_commit_wait)
 
 
 def materialize(spec: ProbeSpec) -> str:

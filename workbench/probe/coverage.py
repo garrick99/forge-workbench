@@ -1027,6 +1027,43 @@ _HMMA_SHAPES = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Axis 22: tma — async tensor-copy synchronization primitives.
+#   First-cut TMA probe family: only the standalone commit_group /
+#   wait_group sync ops (no tensor descriptor needed, runs single-thread).
+#   Future expansion: tensor.1d / tensor.2d load+store with mbarrier
+#   sequencing — needs runner.py changes for cuTensorMap setup.
+# ---------------------------------------------------------------------------
+
+_TMA_WAIT_COUNTS  = (0, 1, 2, 4)
+_TMA_COMMIT_FANS  = (1, 2, 4)
+
+
+def axis_tma_bins() -> list[str]:
+    return [f"commits={c}/wait={w}"
+            for c in _TMA_COMMIT_FANS
+            for w in _TMA_WAIT_COUNTS]
+
+
+def synthesize_tma(bin_key: str) -> ProbeSpec | None:
+    parts = bin_key.split("/")
+    if len(parts) != 2:
+        return None
+    c_part, w_part = parts
+    if not c_part.startswith("commits=") or not w_part.startswith("wait="):
+        return None
+    try:
+        c = int(c_part[len("commits="):])
+        w = int(w_part[len("wait="):])
+    except ValueError:
+        return None
+    return ProbeSpec(
+        template_id="tma_commit_wait",
+        target_op="cp.async.bulk.commit_group",
+        operand_spec={"n_commits": c, "wait_count": w},
+    )
+
+
 def axis_hmma_bins() -> list[str]:
     return list(_HMMA_SHAPES.keys())
 
@@ -1080,6 +1117,7 @@ AXES: dict[str, tuple[Callable[[], list[str]],
     "pred_composition":   (axis_pred_composition_bins, synthesize_pred_composition),
     "shared_barrier":     (axis_shared_barrier_bins,   synthesize_shared_barrier),
     "hmma":               (axis_hmma_bins,             synthesize_hmma),
+    "tma":                (axis_tma_bins,              synthesize_tma),
     "auto_dispatch":      (axis_auto_dispatch_bins,    synthesize_auto_dispatch),
     "regression":         (axis_regression_bins,       synthesize_regression),
 }

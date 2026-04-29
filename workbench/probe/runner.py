@@ -146,6 +146,13 @@ _PTX_TO_SASS_OPCODE_HINTS = {
     # Tensor cores: HMMA opcodes vary across SM, broad hint set
     "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32":
                      {0x23c, 0x23d, 0x83c, 0x83d, 0x42c, 0x42d, 0x82c, 0x82d},
+    # TMA async-copy sync primitives (sm_120)
+    "cp.async.bulk.commit_group":   {0x9b7},   # UTMACMDFLUSH
+    "cp.async.bulk.wait_group":     {0x9af},   # DEPBAR.LE / LDGDEPBAR
+    # TMA tensor copy (placeholders for the future tensor.{1d,2d} probe family)
+    "cp.async.bulk.tensor.1d.shared::cluster.global.tile":  {0x5b4},  # UTMALDG.1D
+    "cp.async.bulk.tensor.2d.shared::cluster.global.tile":  {0x5b4},  # UTMALDG.2D (same opcode, b9=0x80)
+    "cp.async.bulk.tensor.1d.global.shared::cta.tile":      {0x3b5},  # UTMASTG.1D
 }
 
 
