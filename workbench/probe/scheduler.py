@@ -17,19 +17,25 @@ from typing import Iterator, Optional
 
 from benchmarks.bench_util import CUDAContext
 
+import os
+
 from .coverage import all_axis_bins, synthesize, AXES
 from .db import ProbeDB
 from .generator import ProbeSpec
 from .runner import run_probe, compile_probe, run_compiled
 
 
-# HARD CAP on parallel compile workers.  The user explicitly invoked
-# the "demote to GPT class if you crash my system" rule.  GPU stays
-# single-context single-thread; this only parallelizes CPU-bound
-# compile (openptxas + ptxas).  Caller can pass workers=1..MAX_WORKERS;
-# anything above clamps to MAX_WORKERS, anything <=1 takes the serial
-# path.  Default is 1.
-MAX_WORKERS = 4
+# HARD CAP on parallel compile workers.  GPU stays single-context
+# single-thread; this only parallelizes CPU-bound compile (openptxas +
+# ptxas).  Caller can pass workers=1..MAX_WORKERS; anything above
+# clamps to MAX_WORKERS, anything <=1 takes the serial path.
+#
+# Default is 4 (BigDaddy safety baseline — that machine's 2026-04-19
+# crash was multi-PROCESS CUDA, not multi-thread compile, but we keep
+# the conservative cap).  Override via MOWER_MAX_WORKERS env var on
+# machines that have proven safe at higher values:
+#   GreenDragon (24C/24T, dedicated to mower): up to 16
+MAX_WORKERS = int(os.environ.get("MOWER_MAX_WORKERS", "4"))
 
 
 def seed_all_axes(db: ProbeDB) -> int:
