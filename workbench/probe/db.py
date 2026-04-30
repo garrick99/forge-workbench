@@ -241,23 +241,55 @@ class ProbeDB:
 
     # ---- probe insert ----
 
+    # Columns that are *always* refreshable: re-running a probe gives a
+    # fresh measurement.  On UNIQUE conflict (same template_id+ptx_sha),
+    # we UPDATE these from the new run if they were NULL on the old row.
+    # This is what backfills perf-oracle timings into rows that were
+    # inserted by older code that didn't measure them.  Correctness
+    # fields (target_byte_match, gpu_correct, target_*_raw, etc.) are
+    # NOT in this set: they're a function of cubin bytes, which are
+    # already keyed by ptx_sha, so re-measuring is a no-op.
+    _BACKFILL_COLS = (
+        "ours_runtime_ms_mean", "ours_runtime_ms_min", "ours_runtime_ms_max",
+        "ptxas_runtime_ms_mean", "ptxas_runtime_ms_min", "ptxas_runtime_ms_max",
+    )
+
     def insert_probe(self, row: dict) -> int:
-        """Insert a probe row.  Returns probe_id.  Idempotent on (template_id, ptx_sha)."""
+        """Insert a probe row.  Returns probe_id.  On UNIQUE conflict
+        (template_id, ptx_sha), backfills perf-oracle timing columns
+        from the new row when the existing row has them NULL — so a
+        mower running new code can fill in timings for rows inserted
+        by older code without disturbing correctness fields."""
         cols = sorted(row.keys())
         placeholders = ",".join("?" for _ in cols)
         col_list = ",".join(cols)
-        sql = (f"INSERT OR IGNORE INTO probes ({col_list}) "
-               f"VALUES ({placeholders})")
+        # Build the ON CONFLICT clause: only UPDATE backfill cols, and
+        # only when the existing value is NULL (don't overwrite a
+        # measurement with a different one — single-source-of-truth
+        # for any one row).
+        backfill_present = [c for c in self._BACKFILL_COLS if c in row]
+        if backfill_present:
+            update_clauses = ", ".join(
+                f"{c} = COALESCE({c}, excluded.{c})" for c in backfill_present)
+            sql = (f"INSERT INTO probes ({col_list}) "
+                   f"VALUES ({placeholders}) "
+                   f"ON CONFLICT(template_id, ptx_sha) "
+                   f"DO UPDATE SET {update_clauses}")
+        else:
+            sql = (f"INSERT OR IGNORE INTO probes ({col_list}) "
+                   f"VALUES ({placeholders})")
         cur = self.conn.execute(sql, [row[c] for c in cols])
-        if cur.rowcount == 0:
-            # already existed; return the existing probe_id
-            cur = self.conn.execute(
-                "SELECT probe_id FROM probes WHERE template_id=? AND ptx_sha=?",
-                (row["template_id"], row["ptx_sha"]))
-            res = cur.fetchone()
-            return res[0] if res else -1
+        # In the UPSERT path lastrowid points at the affected row whether
+        # inserted or updated; in the IGNORE path it's 0 on conflict.
+        if cur.lastrowid:
+            self.conn.commit()
+            return cur.lastrowid
+        cur = self.conn.execute(
+            "SELECT probe_id FROM probes WHERE template_id=? AND ptx_sha=?",
+            (row["template_id"], row["ptx_sha"]))
+        res = cur.fetchone()
         self.conn.commit()
-        return cur.lastrowid
+        return res[0] if res else -1
 
     # ---- coverage ----
 
