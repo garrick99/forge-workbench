@@ -8,35 +8,35 @@
 .address_size 64
 .visible .entry probe(.param .u64 p_out, .param .u32 n)
 {
-    .reg .u32 %t0, %nv, %a, %b, %lo, %hi, %r;
-    .reg .u64 %p, %off, %pg;
-    .reg .pred %guard;
+    .reg .u32 %r<8>;
+    .reg .u64 %rd<4>;
+    .reg .pred %p0;
 
-    mov.u32 %t0, %tid.x;
-    ld.param.u32 %nv, [n];
-    setp.ge.u32 %guard, %t0, %nv;
-    @%guard ret;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n];
+    setp.ge.u32 %p0, %r0, %r1;
+    @%p0 ret;
 
-    add.u32 %a, %t0, 1;
-    mov.u32 %b, 0xDEADBEEF;
-    mul.lo.u32 %lo, %a, %b;
-    mul.hi.u32 %hi, %a, %b;
-    add.cc.u32 %lo, %lo, 0x12345678;
-    addc.u32   %hi, %hi, 0;
+    add.u32 %r2, %r0, 1;
+    mov.u32 %r3, 0xDEADBEEF;
+    mul.lo.u32 %r4, %r2, %r3;
+    mul.hi.u32 %r5, %r2, %r3;
+    add.cc.u32 %r4, %r4, 0x12345678;
+    addc.u32   %r5, %r5, 0;
 
     // Mod (2^31 - 1) reduction, two passes to settle the carry from
     // the first reduction (typical M31 reduction pattern).
-    and.b32 %r,  %lo, 0x7FFFFFFF;
-    shr.b32 %lo, %lo, 31;
-    add.u32 %r,  %r,  %lo;
-    and.b32 %lo, %r,  0x7FFFFFFF;
-    shr.b32 %r,  %r,  31;
-    add.u32 %r,  %r,  %lo;
+    and.b32 %r6, %r4, 0x7FFFFFFF;
+    shr.b32 %r4, %r4, 31;
+    add.u32 %r6, %r6, %r4;
+    and.b32 %r4, %r6, 0x7FFFFFFF;
+    shr.b32 %r6, %r6, 31;
+    add.u32 %r6, %r6, %r4;
 
-    ld.param.u64 %p, [p_out];
-    mul.wide.u32 %off, %t0, 4;
-    add.u64 %pg, %p, %off;
-    cvta.to.global.u64 %pg, %pg;
-    st.global.u32 [%pg], %r;
+    ld.param.u64 %rd0, [p_out];
+    mul.wide.u32 %rd1, %r0, 4;
+    add.u64 %rd2, %rd0, %rd1;
+    cvta.to.global.u64 %rd2, %rd2;
+    st.global.u32 [%rd2], %r6;
     ret;
 }
