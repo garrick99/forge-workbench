@@ -29,6 +29,11 @@ export PYTHONIOENCODING="${PYTHONIOENCODING:-utf-8}"
 export PYTHONPATH="${PYTHONPATH:-$HOME/openptxas:$HOME/forge-workbench}"
 export OPENPTXAS_ISEL="${OPENPTXAS_ISEL:-$HOME/openptxas/sass/isel.py}"
 export MOWER_MAX_WORKERS="${MOWER_MAX_WORKERS:-16}"
+# Bandit-driven axis selection during soak.  Reward = 1 per hit
+# (byte_diff / gpu_incorrect / >=3x perf delta), 0 otherwise.  Drifts
+# probe budget toward axes producing signal; eps=0.30 keeps an
+# explore floor.  Set to "0" in env to fall back to uniform-random soak.
+export MOWER_BANDIT="${MOWER_BANDIT:-1}"
 # CUDA on PATH for ptxas oracle + WSL2 nvidia libs.
 export PATH="/usr/local/cuda/bin:/usr/lib/wsl/lib:$PATH"
 
