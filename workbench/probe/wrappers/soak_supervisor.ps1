@@ -57,9 +57,37 @@ Set-Location $WorkDir
 New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
 
 $RESPAWN_EXIT = 99
-$count = 0
+$TargetFile   = 'C:\mower\.workers_target'   # written by gpu_throttle.ps1
+$StopFile     = 'C:\mower\.supervisor_stop'  # touch this to halt the supervisor
+$count        = 0
+
+# Restart-rate guard: if probe-loop crashes immediately N times in M
+# seconds, treat that as a real failure and exit so the operator sees
+# it.  Throttle-induced kills are "normal" but a runaway crash loop
+# wastes the GPU.
+$consecutiveBadExits = 0
+$BAD_EXIT_LIMIT = 5         # 5 in a row → stop
+$MIN_RUN_SEC    = 30        # exits before this count as "bad"
 
 while ($true) {
+    if (Test-Path $StopFile) {
+        Write-Output "[supervisor] stop file present; exiting"
+        Remove-Item $StopFile -Force -ErrorAction SilentlyContinue
+        exit 0
+    }
+
+    # GPU-throttle-aware worker selection.  If gpu_throttle.ps1 has
+    # written a target, use it; otherwise fall back to env / default.
+    $effectiveWorkers = $Workers
+    if (Test-Path $TargetFile) {
+        try {
+            $tgt = (Get-Content $TargetFile -Raw | ConvertFrom-Json).workers
+            if ($tgt -ge 1 -and $tgt -le 16) {
+                $effectiveWorkers = "$tgt"
+            }
+        } catch { }
+    }
+
     $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
     $log   = Join-Path $LogDir "soak_$stamp.log"
 
@@ -69,18 +97,19 @@ while ($true) {
 
     @(
         "[supervisor] === probe-loop starting (respawn $count) ==="
-        "[supervisor] start: $(Get-Date -Format 'o')"
-        "[supervisor] log:   $log"
-        "[supervisor] probe-dir: $ProbeDir  workers: $Workers  budget: ${Budget}s"
+        "[supervisor] start:     $(Get-Date -Format 'o')"
+        "[supervisor] log:       $log"
+        "[supervisor] probe-dir: $ProbeDir  workers: $effectiveWorkers  budget: ${Budget}s"
     ) | Out-File -FilePath $log -Encoding utf8
 
+    $runStart = Get-Date
     $args = @(
         '-m', 'workbench', 'probe-loop',
         '--probe-dir', $ProbeDir,
         '--soak',
         '--budget', $Budget,
         '--max-probes', $MaxProbes,
-        '--workers', $Workers
+        '--workers', $effectiveWorkers
     )
 
     # IMPORTANT: do NOT pipe through ForEach-Object / Out-File.  PowerShell
@@ -96,29 +125,50 @@ while ($true) {
     "[supervisor] exit: $(Get-Date -Format 'o')  code=$code" |
         Add-Content -Path $log -Encoding utf8
 
+    $runDuration = ((Get-Date) - $runStart).TotalSeconds
+
     if ($code -eq $RESPAWN_EXIT) {
         "[supervisor] respawn requested (code $RESPAWN_EXIT); restarting in 5s" |
             Add-Content -Path $log -Encoding utf8
+        $consecutiveBadExits = 0
         $count++
         Start-Sleep -Seconds 5
         continue
     }
 
     if ($code -eq 0) {
-        # Budget exhausted but the soak completed cleanly.  In 24/7 mode
-        # we restart with a fresh log + a rotated soak seed so coverage
-        # keeps expanding.  The supervisor only stops on a non-zero,
-        # non-99 error (which signals something needs attention).
+        # Clean budget-exhaust: rotate the soak round.
         "[supervisor] clean budget-exhaust (code 0); restarting for next round in 30s" |
             Add-Content -Path $log -Encoding utf8
+        $consecutiveBadExits = 0
         $count++
         Start-Sleep -Seconds 30
         continue
     }
 
-    # Anything else is a real error — stop the supervisor so the operator
-    # sees it.  The Scheduled Task records LastTaskResult = $code.
-    "[supervisor] terminal exit code $code; supervisor done" |
+    # Non-zero exit.  Could be: (a) gpu_throttle externally killed the
+    # python because workers target changed (this is desired and frequent),
+    # or (b) a real crash.  Heuristic: a kill that happened AFTER the
+    # mower had been running for ≥ MIN_RUN_SEC is treated as a normal
+    # throttle event; an immediate non-zero exit is "bad".
+    if ($runDuration -ge $MIN_RUN_SEC) {
+        "[supervisor] external exit code=$code after ${runDuration}s (likely throttle); restarting in 5s" |
+            Add-Content -Path $log -Encoding utf8
+        $consecutiveBadExits = 0
+        $count++
+        Start-Sleep -Seconds 5
+        continue
+    }
+
+    # Suspiciously fast exit.
+    $consecutiveBadExits++
+    "[supervisor] FAST exit code=$code after ${runDuration}s (bad-streak=$consecutiveBadExits/$BAD_EXIT_LIMIT)" |
         Add-Content -Path $log -Encoding utf8
-    exit $code
+    if ($consecutiveBadExits -ge $BAD_EXIT_LIMIT) {
+        "[supervisor] bad-exit limit reached; supervisor stopping for operator review" |
+            Add-Content -Path $log -Encoding utf8
+        exit $code
+    }
+    Start-Sleep -Seconds 30
+    $count++
 }

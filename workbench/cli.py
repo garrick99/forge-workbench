@@ -4886,28 +4886,50 @@ def _file_single_mode_clusters(data_db_path: str, edges_db_path: str) -> int:
     ):
         existing.add((op, tmpl))
 
+    # "Blowup" threshold: a cluster with this many failing probes is
+    # a runaway / pervasive bug — bump it from severity='high' to
+    # 'blocker' so the operator (and any prioritization downstream)
+    # treats it as urgent.  The mower will keep finding fresh probes
+    # for the same cluster (different operand perturbations) until the
+    # bug is fixed; an early severity-bump shortens the time-to-fix.
+    BLOWUP_THRESHOLD = 200
     n_filed = 0
+    n_blowups = 0
     ts = time.strftime("%Y-%m-%dT%H:%M:%S")
     for tmpl, op, opc, occ, cpid, spec_json in rows:
         if (op, tmpl) in existing:
             continue
         opc_s = f"{opc:#06x}" if opc is not None else "?"
+        sev = "blocker" if occ >= BLOWUP_THRESHOLD else "high"
+        flag = " *** BLOWUP ***" if occ >= BLOWUP_THRESHOLD else ""
         edges.add_edge_case(
             category="codegen",
-            title=f"single-host anomaly: {op} {tmpl} (opcode {opc_s})",
+            title=(f"{'BLOWUP: ' if sev == 'blocker' else ''}"
+                   f"single-host anomaly: {op} {tmpl} (opcode {opc_s})"),
             description=(f"GreenDragon detective surfaced {occ} probe(s) "
-                         f"with this (template, target_op, opcode) tuple "
-                         f"GPU-incorrect.  Auto-filed by probe-watch single-db "
-                         f"mode at {ts}."),
+                         f"GPU-incorrect for this (template, target_op, "
+                         f"opcode) cluster.  Auto-filed by probe-watch "
+                         f"single-db mode at {ts}."
+                         + (f"\n\nBLOWUP — cluster size >= "
+                            f"{BLOWUP_THRESHOLD}; this bug is being hit "
+                            f"by many distinct probes and warrants "
+                            f"immediate triage."
+                            if sev == "blocker" else "")),
             target_op=op,
             template_id=tmpl,
             operand_spec=spec_json,
             repro_probe_id=cpid,
-            severity="high",
+            severity=sev,
             related_bug=f"gd-detective",
-            notes=f"auto-filed by probe-watch --single-db at {ts}",
+            notes=f"auto-filed by probe-watch --single-db at {ts} "
+                  f"(occurrences={occ})",
         )
         n_filed += 1
+        if sev == "blocker":
+            n_blowups += 1
+            print(f"  *** BLOWUP cluster ({occ} probes): {op} {tmpl} "
+                  f"opcode={opc_s} → severity=blocker, repro=#{cpid} ***",
+                  flush=True)
     edges.close()
     return n_filed
 
