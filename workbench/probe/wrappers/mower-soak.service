@@ -1,0 +1,16 @@
+[Unit]
+Description=GreenDragon mower probe-loop supervisor
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/mower/bin/soak_supervisor.sh
+Restart=always
+RestartSec=10
+# Don't kill the whole process group on stop -- supervisor manages
+# its python child with a respawn loop and graceful exit codes.
+KillMode=process
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

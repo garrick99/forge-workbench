@@ -223,6 +223,78 @@ def _run_cubin(ctx: CUDAContext, cubin: bytes,
     return raw
 
 
+def _time_cubin(ctx: CUDAContext, cubin: bytes,
+                n_threads: int = N_THREADS,
+                extra_buf: bool = False,
+                n_runs: int = 5) -> tuple[bytes | None, list[float]]:
+    """Like _run_cubin but also times N kernel launches with cuEvents.
+
+    Returns (output_bytes, runtimes_ms_list).  output_bytes is from the
+    warmup launch (so correctness comparison sees it).  The N timed runs
+    happen after, on the same cubin/args, with output buffer zeroed each
+    time to keep workload identical.
+
+    Events are created lazily on the ctx and reused across probes so a
+    long soak doesn't leak one pair per probe.  No event_destroy needed
+    in the steady state — the events live for the worker's lifetime.
+    """
+    if not ctx.load(cubin):
+        return None, []
+    try:
+        func = ctx.get_func("probe")
+    except AssertionError:
+        return None, []
+    out_dev = ctx.alloc(n_threads * 4)
+    ctx.memset_d8(out_dev, 0, n_threads * 4)
+    in_dev = None
+    if extra_buf:
+        in_dev = ctx.alloc(n_threads * 4)
+        ctx.memset_d8(in_dev, 0, n_threads * 4)
+
+    p_out = ctypes.c_uint64(out_dev)
+    n_val = ctypes.c_uint32(n_threads)
+    if extra_buf:
+        p_in = ctypes.c_uint64(in_dev)
+        args = (ctypes.c_void_p * 3)(
+            ctypes.cast(ctypes.byref(p_out), ctypes.c_void_p),
+            ctypes.cast(ctypes.byref(p_in), ctypes.c_void_p),
+            ctypes.cast(ctypes.byref(n_val), ctypes.c_void_p))
+    else:
+        args = (ctypes.c_void_p * 2)(
+            ctypes.cast(ctypes.byref(p_out), ctypes.c_void_p),
+            ctypes.cast(ctypes.byref(n_val), ctypes.c_void_p))
+
+    # Warmup launch — also captures the canonical output for correctness.
+    rc = ctx.launch(func, (1, 1, 1), (n_threads, 1, 1), args)
+    if rc != 0:
+        ctx.free(out_dev)
+        if in_dev: ctx.free(in_dev)
+        return None, []
+    if ctx.sync() != 0:
+        ctx.free(out_dev)
+        if in_dev: ctx.free(in_dev)
+        return None, []
+    raw = ctx.copy_from(out_dev, n_threads * 4)
+
+    if not hasattr(ctx, "_probe_evt_start"):
+        ctx._probe_evt_start = ctx.event_create()
+        ctx._probe_evt_stop  = ctx.event_create()
+    times: list[float] = []
+    for _ in range(n_runs):
+        ctx.memset_d8(out_dev, 0, n_threads * 4)
+        ctx.event_record(ctx._probe_evt_start)
+        rc = ctx.launch(func, (1, 1, 1), (n_threads, 1, 1), args)
+        ctx.event_record(ctx._probe_evt_stop)
+        if rc != 0:
+            break
+        ms = ctx.event_elapsed_ms(ctx._probe_evt_start, ctx._probe_evt_stop)
+        times.append(ms)
+
+    ctx.free(out_dev)
+    if in_dev: ctx.free(in_dev)
+    return raw, times
+
+
 def determinism_check(spec: ProbeSpec, db: ProbeDB,
                       ctx: Optional[CUDAContext] = None,
                       runs: int = 5) -> dict:
@@ -376,8 +448,9 @@ def run_compiled(compiled: dict, db: ProbeDB,
 
     if gpu and ctx is not None:
         extra = spec.template_id in ("load_consume",)
-        ours_out = _run_cubin(ctx, ours_cubin, extra_buf=extra)
-        ptxas_out = _run_cubin(ctx, ptxas_cubin, extra_buf=extra)
+        ours_out,  ours_times  = _time_cubin(ctx, ours_cubin,  extra_buf=extra)
+        ptxas_out, ptxas_times = _time_cubin(ctx, ptxas_cubin, extra_buf=extra)
+        _record_timings(row, ours_times, ptxas_times)
         if ours_out is not None and ptxas_out is not None:
             ours_vs_oracle = ours_out == ptxas_out
             ours_vs_expected = _check_correct(ours_out, spec)
@@ -390,6 +463,20 @@ def run_compiled(compiled: dict, db: ProbeDB,
             row["error"] = (row.get("error") or "") + " gpu-launch:ours-failed"
 
     return db.insert_probe(row)
+
+
+def _record_timings(row: dict,
+                    ours_times: list[float],
+                    ptxas_times: list[float]) -> None:
+    """Stash mean/min/max into the row for whichever sides ran."""
+    if ours_times:
+        row["ours_runtime_ms_mean"] = sum(ours_times) / len(ours_times)
+        row["ours_runtime_ms_min"]  = min(ours_times)
+        row["ours_runtime_ms_max"]  = max(ours_times)
+    if ptxas_times:
+        row["ptxas_runtime_ms_mean"] = sum(ptxas_times) / len(ptxas_times)
+        row["ptxas_runtime_ms_min"]  = min(ptxas_times)
+        row["ptxas_runtime_ms_max"]  = max(ptxas_times)
 
 
 # ---------------------------------------------------------------------------
@@ -463,12 +550,13 @@ def run_probe(spec: ProbeSpec, db: ProbeDB,
         row["ptxas_wdep"] = pc["wdep"]
         row["ptxas_rbar"] = pc["rbar"]
 
-    # ---- GPU run + correctness check ----
+    # ---- GPU run + correctness check + perf oracle ----
     if gpu and ctx is not None:
         # Templates with a 3rd param (p_in) need the extra buffer.
         extra = spec.template_id in ("load_consume",)
-        ours_out = _run_cubin(ctx, ours_cubin, extra_buf=extra)
-        ptxas_out = _run_cubin(ctx, ptxas_cubin, extra_buf=extra)
+        ours_out,  ours_times  = _time_cubin(ctx, ours_cubin,  extra_buf=extra)
+        ptxas_out, ptxas_times = _time_cubin(ctx, ptxas_cubin, extra_buf=extra)
+        _record_timings(row, ours_times, ptxas_times)
         if ours_out is not None and ptxas_out is not None:
             # ours is correct iff its output matches both the expected
             # function (if known) AND ptxas's output (oracle).
@@ -482,7 +570,6 @@ def run_probe(spec: ProbeSpec, db: ProbeDB,
         elif ours_out is None:
             row["gpu_correct"] = 0
             row["error"] = (row.get("error") or "") + " gpu-launch:ours-failed"
-        # timing optional — skip in v1 to keep probes fast
 
     return db.insert_probe(row)
 

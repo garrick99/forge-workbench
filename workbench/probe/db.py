@@ -49,6 +49,16 @@ CREATE TABLE IF NOT EXISTS probes (
     runtime_ms_min    REAL,
     runtime_ms_max    REAL,
     runtime_runs_json TEXT,
+    -- Perf oracle (added 2026-04-30): per-cubin runtime.  Populated
+    -- by the runner's _time_cubin path.  ours_*_ms_* describe
+    -- openptxas-emitted SASS; ptxas_*_ms_* describe nvcc/ptxas's.
+    -- The delta (ours - ptxas) is the codegen-quality signal.
+    ours_runtime_ms_mean   REAL,
+    ours_runtime_ms_min    REAL,
+    ours_runtime_ms_max    REAL,
+    ptxas_runtime_ms_mean  REAL,
+    ptxas_runtime_ms_min   REAL,
+    ptxas_runtime_ms_max   REAL,
     git_openptxas     TEXT,
     ptxas_version     TEXT,
     sm_version        TEXT,
@@ -178,7 +188,28 @@ class ProbeDB:
         self.conn.execute("PRAGMA temp_store=MEMORY")
         self.conn.execute("PRAGMA cache_size=-65536")  # 64MB page cache
         self.conn.executescript(_SCHEMA)
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        """Apply column additions to existing DBs.  SQLite's executescript
+        with CREATE TABLE IF NOT EXISTS skips creation when the table
+        already exists, so new columns added to _SCHEMA only land on
+        fresh DBs without an explicit ALTER TABLE here."""
+        cur = self.conn.execute("PRAGMA table_info(probes)")
+        existing = {row[1] for row in cur.fetchall()}
+        new_cols = [
+            ("ours_runtime_ms_mean",  "REAL"),
+            ("ours_runtime_ms_min",   "REAL"),
+            ("ours_runtime_ms_max",   "REAL"),
+            ("ptxas_runtime_ms_mean", "REAL"),
+            ("ptxas_runtime_ms_min",  "REAL"),
+            ("ptxas_runtime_ms_max",  "REAL"),
+        ]
+        for col, ty in new_cols:
+            if col not in existing:
+                self.conn.execute(
+                    f"ALTER TABLE probes ADD COLUMN {col} {ty}")
 
     # ---- content store ----
 

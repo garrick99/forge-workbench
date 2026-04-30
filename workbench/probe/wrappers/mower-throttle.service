@@ -1,0 +1,13 @@
+[Unit]
+Description=GreenDragon mower GPU-aware throttle daemon
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/mower/bin/gpu_throttle.sh
+Restart=always
+RestartSec=10
+KillMode=process
+
+[Install]
+WantedBy=default.target
