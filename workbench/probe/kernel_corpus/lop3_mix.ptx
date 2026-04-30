@@ -3,7 +3,7 @@
 // covers LOP3, but this is exactly the pattern where ptxas's peephole
 // catalog has historically been ahead of ours.  Each thread XORs the
 // majority mix with its tid so the output is deterministic.
-.version 8.0
+.version 9.0
 .target sm_120
 .address_size 64
 .visible .entry probe(.param .u64 p_out, .param .u32 n)
