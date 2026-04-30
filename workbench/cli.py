@@ -4950,6 +4950,41 @@ def _cmd_probe_watch(args):
                     print(f"    {line}")
                 f.write(f"# autofix-cmd: workbench probe-autofix <eid> "
                         f"--probe-dir <dir> --openptxas-repo <repo>\n")
+
+            # Auto-dispatch: for each new edge, run --dispatch-cmd
+            # with the edge_id as the first argument.  The dispatch
+            # command is responsible for the actual agent invocation
+            # (e.g. claude CLI, anthropic SDK script, or a custom
+            # workflow).  Limit concurrency to --max-concurrent-fixes
+            # so we don't flood the GPU with parallel probe-commit
+            # validation runs.
+            if args.dispatch_cmd:
+                import concurrent.futures as _cf
+                max_par = max(1, args.max_concurrent_fixes)
+                print(f"  dispatching {len(new_rows)} fix agent(s) "
+                      f"(max-concurrent={max_par})")
+
+                def _run_dispatch(eid: int) -> tuple[int, int, str]:
+                    cmd_str = args.dispatch_cmd.replace("{eid}", str(eid))
+                    if "{eid}" not in args.dispatch_cmd:
+                        cmd_str = f"{args.dispatch_cmd} {eid}"
+                    try:
+                        rd = subprocess.run(cmd_str, shell=True,
+                                            capture_output=True, text=True,
+                                            timeout=args.dispatch_timeout)
+                        tail = (rd.stderr or rd.stdout or "").strip().splitlines()
+                        last = tail[-1] if tail else ""
+                        return (eid, rd.returncode, last[:200])
+                    except subprocess.TimeoutExpired:
+                        return (eid, -1, f"TIMEOUT after {args.dispatch_timeout}s")
+
+                with _cf.ThreadPoolExecutor(max_workers=max_par) as pool:
+                    futs = [pool.submit(_run_dispatch, eid)
+                            for eid, _, _, _, _ in new_rows]
+                    for fut in _cf.as_completed(futs):
+                        eid, rc, tail = fut.result()
+                        marker = "OK" if rc == 0 else f"FAIL({rc})"
+                        print(f"    dispatch edge_{eid}: {marker}  {tail}")
         else:
             print(f"  no new edges (current max edge_id: {pre_max})")
 
@@ -8760,6 +8795,21 @@ def main():
     p_pwatch.add_argument("--pre-cycle-timeout", type=int, default=180,
                           help="seconds before aborting --pre-cycle-cmd "
                                "(default: 180)")
+    p_pwatch.add_argument("--dispatch-cmd", default=None,
+                          help="shell command to run for each newly-filed "
+                               "edge_case.  The literal '{eid}' is replaced "
+                               "with the edge_id; otherwise the eid is "
+                               "appended as the last argument.  Typical use: "
+                               "a wrapper that calls `workbench probe-autofix` "
+                               "to generate the prompt and then dispatches it "
+                               "to a Claude agent (CLI, API, or session).")
+    p_pwatch.add_argument("--dispatch-timeout", type=int, default=1800,
+                          help="seconds before aborting a single fix agent "
+                               "(default: 1800 = 30 min)")
+    p_pwatch.add_argument("--max-concurrent-fixes", type=int, default=1,
+                          help="max parallel fix agents to dispatch per "
+                               "cycle (default: 1 — keeps GPU contention "
+                               "from validation gates manageable)")
 
     # ---- probe-autofix: generate a self-contained agent fix prompt ----
     p_paf = sub.add_parser(
