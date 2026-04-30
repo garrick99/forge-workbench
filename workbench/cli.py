@@ -4817,7 +4817,8 @@ def _cmd_probe_loop(args):
     return 0
 
 
-def _file_single_mode_clusters(data_db_path: str, edges_db_path: str) -> int:
+def _file_single_mode_clusters(data_db_path: str, edges_db_path: str,
+                               max_age_hours: int | None = None) -> int:
     """Single-DB anomaly scan: find gpu_incorrect probe clusters in
     `data_db_path` that don't already have a matching open edge_case
     in `edges_db_path`, and INSERT them into the edges DB.
@@ -4825,6 +4826,13 @@ def _file_single_mode_clusters(data_db_path: str, edges_db_path: str) -> int:
     Cluster grain: (template_id, target_op, target_opcode).  For each
     cluster we record the canonical reproducer (min probe_id), the
     occurrence count, and severity='high'.
+
+    `max_age_hours`: if set, only cluster probes whose ts is within
+    the last N hours.  Critical for an hourly auto-fix loop — without
+    it, every cycle re-files stale gpu_incorrect rows from before
+    earlier fixes landed (the DB's UNIQUE constraint keeps those rows
+    around indefinitely), and the dispatcher wastes claude budget
+    investigating already-resolved bugs.
 
     Returns the number of newly-filed edges.
     """
@@ -4852,16 +4860,23 @@ def _file_single_mode_clusters(data_db_path: str, edges_db_path: str) -> int:
     data = sqlite3.connect(f"file:{data_path}?mode=ro", uri=True)
 
     # Cluster gpu_incorrect probes by (template_id, target_op, target_opcode).
-    # First pass: bucket counts + canonical (min) probe_id.
-    cluster_rows = list(data.execute("""
+    # First pass: bucket counts + canonical (min) probe_id.  Optional
+    # recency filter via max_age_hours.
+    age_clause = ""
+    age_params: tuple = ()
+    if max_age_hours is not None:
+        age_clause = "AND ts > datetime('now', ?)"
+        age_params = (f"-{int(max_age_hours)} hours",)
+    cluster_rows = list(data.execute(f"""
         SELECT template_id, target_op, target_opcode,
                COUNT(*) AS occurrences,
                MIN(probe_id) AS canonical_pid
         FROM probes
         WHERE gpu_correct = 0
           AND (error IS NULL OR error = '')
+          {age_clause}
         GROUP BY template_id, target_op, target_opcode
-    """))
+    """, age_params))
     # Second pass: fetch operand_spec for each canonical_pid.
     rows = []
     for tmpl, op, opc, occ, cpid in cluster_rows:
@@ -5039,7 +5054,8 @@ def _cmd_probe_watch(args):
             # gpu_incorrect probes that don't already have a matching
             # open edge_case in the edges DB.
             try:
-                _file_single_mode_clusters(args.single_db, args.edges_db)
+                _file_single_mode_clusters(args.single_db, args.edges_db,
+                                           max_age_hours=args.max_age_hours)
             except Exception as e:
                 print(f"  single-db scan failed: {e}")
         else:
@@ -8964,6 +8980,15 @@ def main():
                           help="max parallel fix agents to dispatch per "
                                "cycle (default: 1 — keeps GPU contention "
                                "from validation gates manageable)")
+    p_pwatch.add_argument("--max-age-hours", type=int, default=None,
+                          help="(single-db mode) only file clusters whose "
+                               "canonical probe is within the last N hours.  "
+                               "Without this, an hourly auto-fix loop will "
+                               "re-file stale gpu_incorrect rows from before "
+                               "earlier fixes landed (the DB's UNIQUE "
+                               "constraint keeps those rows around) and "
+                               "waste fix-agent budget on already-resolved "
+                               "bugs.  Recommended: 24 for hourly cadence.")
 
     # ---- probe-autofix: generate a self-contained agent fix prompt ----
     p_paf = sub.add_parser(
