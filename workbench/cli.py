@@ -4817,27 +4817,124 @@ def _cmd_probe_loop(args):
     return 0
 
 
+def _file_single_mode_clusters(data_db_path: str, edges_db_path: str) -> int:
+    """Single-DB anomaly scan: find gpu_incorrect probe clusters in
+    `data_db_path` that don't already have a matching open edge_case
+    in `edges_db_path`, and INSERT them into the edges DB.
+
+    Cluster grain: (template_id, target_op, target_opcode).  For each
+    cluster we record the canonical reproducer (min probe_id), the
+    occurrence count, and severity='high'.
+
+    Returns the number of newly-filed edges.
+    """
+    import os
+    import sqlite3
+    import time
+    from workbench.probe import ProbeDB
+
+    # Resolve paths (accept either a file or a probe-dir)
+    def _resolve(p: str) -> str:
+        ap = os.path.abspath(p)
+        if os.path.isdir(ap):
+            cand = os.path.join(ap, "probes.sqlite")
+            if os.path.isfile(cand):
+                return cand
+        return ap
+
+    data_path = _resolve(data_db_path)
+    edges_path = _resolve(edges_db_path)
+    edges_dir = (os.path.dirname(edges_path) if edges_path.endswith(".sqlite")
+                 else edges_path)
+
+    # Open data DB read-only (it gets overwritten on every pre-cycle pull;
+    # we don't write anything to it).
+    data = sqlite3.connect(f"file:{data_path}?mode=ro", uri=True)
+
+    # Cluster gpu_incorrect probes by (template_id, target_op, target_opcode).
+    # First pass: bucket counts + canonical (min) probe_id.
+    cluster_rows = list(data.execute("""
+        SELECT template_id, target_op, target_opcode,
+               COUNT(*) AS occurrences,
+               MIN(probe_id) AS canonical_pid
+        FROM probes
+        WHERE gpu_correct = 0
+          AND (error IS NULL OR error = '')
+        GROUP BY template_id, target_op, target_opcode
+    """))
+    # Second pass: fetch operand_spec for each canonical_pid.
+    rows = []
+    for tmpl, op, opc, occ, cpid in cluster_rows:
+        spec_row = data.execute(
+            "SELECT operand_spec FROM probes WHERE probe_id = ?",
+            (cpid,)).fetchone()
+        spec_json = spec_row[0] if spec_row else None
+        rows.append((tmpl, op, opc, occ, cpid, spec_json))
+    data.close()
+
+    if not rows:
+        return 0
+
+    # For each cluster, check if edges DB already has a matching open
+    # edge.  If not, INSERT.  We key on (target_op, template_id) since
+    # opcode can be NULL for some probes.
+    edges = ProbeDB(edges_dir)
+    existing = set()
+    for op, tmpl in edges.query(
+        "SELECT target_op, template_id FROM edge_cases "
+        "WHERE status IN ('open', 'investigating', 'resolved-pending-verify')"
+    ):
+        existing.add((op, tmpl))
+
+    n_filed = 0
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+    for tmpl, op, opc, occ, cpid, spec_json in rows:
+        if (op, tmpl) in existing:
+            continue
+        opc_s = f"{opc:#06x}" if opc is not None else "?"
+        edges.add_edge_case(
+            category="codegen",
+            title=f"single-host anomaly: {op} {tmpl} (opcode {opc_s})",
+            description=(f"GreenDragon detective surfaced {occ} probe(s) "
+                         f"with this (template, target_op, opcode) tuple "
+                         f"GPU-incorrect.  Auto-filed by probe-watch single-db "
+                         f"mode at {ts}."),
+            target_op=op,
+            template_id=tmpl,
+            operand_spec=spec_json,
+            repro_probe_id=cpid,
+            severity="high",
+            related_bug=f"gd-detective",
+            notes=f"auto-filed by probe-watch --single-db at {ts}",
+        )
+        n_filed += 1
+    edges.close()
+    return n_filed
+
+
 def _cmd_probe_watch(args):
-    """Long-running harvest watcher: runs probe-harvest-pair on a fixed
-    interval and emits a punch-list file of newly-filed edge_cases.
+    """Long-running anomaly watcher: scans probe DB(s) on a fixed
+    interval and auto-files newly-detected bug clusters as edge_cases.
 
-    This is the discovery-side daemon for 24/7 operation.  Combined with
-    a continuously-running soak (managed by soak_supervisor.ps1's
-    no-stop loop), the pipeline is:
+    Two modes:
 
-      while True:
-        sleep <interval>
-        run probe-harvest-pair  → cross-confirm + auto-file new edges
-        write punch list to <punch_list_path>
-        (operator / Claude /loop picks up the punch list and dispatches
-         probe-autofix per new edge_id)
+    (A) Cross-confirm (default — BigDaddy + GreenDragon both mowing):
+        Runs probe-harvest-pair every interval; only files clusters
+        that are gpu_incorrect on BOTH machines (filters hardware
+        noise).  Pass `db_a` and `db_b`, edges go into db_a.
 
-    The watcher is idempotent: running probe-harvest-pair multiple times
-    against the same DBs only files NEW clusters (probe-cross-confirm's
-    --auto-file-edges already de-duplicates against existing edges).
+    (B) Single-DB (GreenDragon-only mowing, BigDaddy detective-free):
+        Pass `--single-db <path>` (typically the freshly-pulled
+        GreenDragon snapshot) and `--edges-db <path>` (a stable
+        tracker DB on BigDaddy that holds edge_cases + fix_history).
+        Anomalies = any (template_id, target_op, target_opcode)
+        cluster with ≥1 gpu_incorrect probe in single-db that doesn't
+        already have a matching open edge_case in edges-db.
 
-    Stops cleanly on Ctrl-C.  Run forever (no --max-cycles) or for a
-    bounded number of cycles for testing.
+    For both modes:
+      * --pre-cycle-cmd refreshes the data DB before each scan
+      * --dispatch-cmd launches a fix agent per newly-filed edge
+      * --punch-list captures everything for offline review
     """
     import argparse as _ap
     import json
@@ -4849,18 +4946,33 @@ def _cmd_probe_watch(args):
     from workbench.probe import ProbeDB
 
     interval = max(60, args.interval)  # never poll faster than once a minute
-    punch_list_path = Path(args.punch_list or
-                            (Path(args.db_a).resolve().parent / "autofix_queue.txt"
-                             if Path(args.db_a).resolve().is_dir()
-                             else Path(args.db_a).resolve().parent / "autofix_queue.txt"))
+    single_mode = bool(args.single_db)
+    if single_mode:
+        if not args.edges_db:
+            print("probe-watch: --single-db requires --edges-db", file=sys.stderr)
+            return 2
+        # In single-db mode the punch list lives next to the edges-db.
+        default_pl = Path(args.edges_db).resolve().parent / "autofix_queue.txt"
+    else:
+        # Cross-confirm mode: punch list lives next to db_a.
+        default_pl = (Path(args.db_a).resolve().parent
+                      if not Path(args.db_a).resolve().is_dir()
+                      else Path(args.db_a).resolve()) / "autofix_queue.txt"
+    punch_list_path = Path(args.punch_list or default_pl)
     punch_list_path.parent.mkdir(parents=True, exist_ok=True)
 
     print(f"probe-watch:")
-    print(f"  db_a       = {args.db_a}")
-    print(f"  db_b       = {args.db_b}")
+    if single_mode:
+        print(f"  mode       = single-db (anomaly scan)")
+        print(f"  data DB    = {args.single_db}")
+        print(f"  edges DB   = {args.edges_db}")
+    else:
+        print(f"  mode       = cross-confirm")
+        print(f"  db_a       = {args.db_a}")
+        print(f"  db_b       = {args.db_b}")
     print(f"  interval   = {interval}s")
     print(f"  punch list = {punch_list_path}")
-    print(f"  max cycles = {args.max_cycles or '∞'}")
+    print(f"  max cycles = {args.max_cycles or 'infinite'}")
     print()
 
     cycle = 0
@@ -4887,45 +4999,56 @@ def _cmd_probe_watch(args):
             except subprocess.TimeoutExpired:
                 print(f"  pre-cycle-cmd TIMEOUT after {args.pre_cycle_timeout}s")
 
-        # Snapshot pre-harvest edge_id high water
+        # Snapshot pre-harvest edge_id high water (in the EDGES DB)
+        edges_path = (Path(args.edges_db).resolve() if single_mode
+                      else (Path(args.db_a).resolve() if not Path(args.db_a).resolve().is_dir()
+                            else Path(args.db_a).resolve()))
+        edges_dir = str(edges_path.parent if edges_path.is_file() else edges_path)
         try:
-            db = ProbeDB(str(Path(args.db_a).resolve()) if Path(args.db_a).resolve().is_dir()
-                          else str(Path(args.db_a).resolve().parent))
+            db = ProbeDB(edges_dir)
             pre_max = db.query("SELECT COALESCE(MAX(edge_id), 0) FROM edge_cases")[0][0]
             db.close()
         except Exception as e:
-            print(f"  could not read db_a edge_id high-water: {e}")
+            print(f"  could not read edges DB high-water: {e}")
             pre_max = -1
 
-        # Run probe-harvest-pair as a subprocess to keep this watcher's
-        # state clean — failures in the harvest don't crash the loop.
-        cmd = [sys.executable, "-m", "workbench", "probe-harvest-pair",
-               args.db_a, args.db_b,
-               "--label-a", args.label_a or "A",
-               "--label-b", args.label_b or "B",
-               "--limit", str(args.limit)]
-        try:
-            r = subprocess.run(cmd, capture_output=True, text=True,
-                               timeout=args.harvest_timeout)
-        except subprocess.TimeoutExpired:
-            print(f"  TIMEOUT after {args.harvest_timeout}s")
-            time.sleep(interval)
-            continue
+        if single_mode:
+            # Direct query against the data DB — find clusters of
+            # gpu_incorrect probes that don't already have a matching
+            # open edge_case in the edges DB.
+            try:
+                _file_single_mode_clusters(args.single_db, args.edges_db)
+            except Exception as e:
+                print(f"  single-db scan failed: {e}")
+        else:
+            # Run probe-harvest-pair as a subprocess to keep this watcher's
+            # state clean — failures in the harvest don't crash the loop.
+            cmd = [sys.executable, "-m", "workbench", "probe-harvest-pair",
+                   args.db_a, args.db_b,
+                   "--label-a", args.label_a or "A",
+                   "--label-b", args.label_b or "B",
+                   "--limit", str(args.limit)]
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True,
+                                   timeout=args.harvest_timeout)
+            except subprocess.TimeoutExpired:
+                print(f"  TIMEOUT after {args.harvest_timeout}s")
+                time.sleep(interval)
+                continue
 
-        if r.returncode != 0:
-            print(f"  harvest exited {r.returncode}; stdout:")
-            for line in (r.stdout or "").splitlines()[-20:]:
-                print(f"    {line}")
-            print(f"  stderr:")
-            for line in (r.stderr or "").splitlines()[-20:]:
-                print(f"    {line}")
-            time.sleep(interval)
-            continue
+            if r.returncode != 0:
+                print(f"  harvest exited {r.returncode}; stdout:")
+                for line in (r.stdout or "").splitlines()[-20:]:
+                    print(f"    {line}")
+                print(f"  stderr:")
+                for line in (r.stderr or "").splitlines()[-20:]:
+                    print(f"    {line}")
+                time.sleep(interval)
+                continue
 
-        # Pull newly-filed edges from db_a
+        # Pull newly-filed edges from edges DB
         try:
-            db = ProbeDB(str(Path(args.db_a).resolve()) if Path(args.db_a).resolve().is_dir()
-                          else str(Path(args.db_a).resolve().parent))
+            db = ProbeDB(edges_dir)
             new_rows = db.query(
                 "SELECT edge_id, target_op, template_id, severity, title "
                 "FROM edge_cases WHERE edge_id > ? AND status IN "
@@ -8772,9 +8895,18 @@ def main():
                     "edge_cases, appends them to the punch-list file.  "
                     "An operator (or a Claude /loop) picks up the punch "
                     "list and dispatches probe-autofix for each entry.")
-    p_pwatch.add_argument("db_a", help="first probe DB (file or probe-dir); "
-                                        "this is where new edge_cases get filed")
-    p_pwatch.add_argument("db_b", help="second probe DB")
+    p_pwatch.add_argument("db_a", nargs="?", default=None,
+                          help="(cross-confirm mode) first probe DB; new "
+                               "edge_cases get filed here")
+    p_pwatch.add_argument("db_b", nargs="?", default=None,
+                          help="(cross-confirm mode) second probe DB")
+    p_pwatch.add_argument("--single-db", default=None,
+                          help="(single-db mode) path to the data DB to "
+                               "scan for gpu_incorrect clusters; "
+                               "incompatible with db_a/db_b")
+    p_pwatch.add_argument("--edges-db", default=None,
+                          help="(single-db mode, REQUIRED) path to the "
+                               "tracker DB where new edge_cases are filed")
     p_pwatch.add_argument("--label-a", default=None)
     p_pwatch.add_argument("--label-b", default=None)
     p_pwatch.add_argument("--interval", type=int, default=1800,
