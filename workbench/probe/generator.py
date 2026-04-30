@@ -1349,6 +1349,33 @@ def expected_cvta_addrspace(spec: ProbeSpec, tid: int) -> int:
 TEMPLATES["cvta_addrspace"] = (template_cvta_addrspace, expected_cvta_addrspace)
 
 
+# ---------------------------------------------------------------------------
+# Template: kernel_corpus
+#   Real-world PTX kernels stored as files alongside this module.
+#   Each kernel implements the standard probe ABI
+#   (.entry probe(.param .u64 p_out, .param .u32 n)) and writes a
+#   per-thread u32 to out[tid].  Hits here translate directly to
+#   production codegen wins because the kernels mirror VortexSTARK's
+#   hot paths (FMA chains, LOP3 mixes, Montgomery reduction).
+#
+#   operand_spec keys:
+#     kernel : kernel basename (without .ptx extension)
+#
+#   No expected_output is registered: correctness falls back to the
+#   ours-vs-ptxas oracle, which is exactly what we want for codegen
+#   comparison probes.
+# ---------------------------------------------------------------------------
+
+def template_kernel_corpus(spec: ProbeSpec) -> str:
+    name = spec.operand_spec["kernel"]
+    from pathlib import Path
+    corpus_dir = Path(__file__).parent / "kernel_corpus"
+    return (corpus_dir / f"{name}.ptx").read_text(encoding="utf-8")
+
+
+TEMPLATES["kernel_corpus"] = (template_kernel_corpus, None)
+
+
 def materialize(spec: ProbeSpec) -> str:
     """Return PTX text for a given probe spec."""
     fn, _ = TEMPLATES[spec.template_id]

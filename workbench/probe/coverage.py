@@ -850,6 +850,91 @@ def _regression_rows() -> list[tuple]:
         return []  # edge_cases table doesn't exist yet
 
 
+# ---------------------------------------------------------------------------
+# Axis-pair 1: predicate × destination-register
+#   Bins: {cond}/{thr}/dest={reg}/op={label}
+#   Why this pair: we've been bitten twice by predicate codegen that
+#   silently miscompiled when the destination was the "wrong" register
+#   (R5 conflict in FG32/FG56b — the wrap-renamer didn't know R5 was a
+#   body destination).  Sweeping cond × dest_reg explicitly catches the
+#   2D interaction that 1D axes miss by holding dest fixed at %r2.
+# ---------------------------------------------------------------------------
+
+_PRED_X_REG_OPS = ("add.u32", "xor.b32", "or.b32", "and.b32", "sub.u32",
+                   "shl.b32", "mad.lo.u32")
+_PRED_X_REG_DEST = ("%r2", "%r3", "%r4", "%r5", "%r6", "%r7")
+_PRED_X_REG_CONDS = ("lt", "gt", "eq", "ne")
+_PRED_X_REG_THRS = (0, 1, 32, 64, 127)
+
+
+def axis_pred_x_reg_bins() -> list[str]:
+    bins = []
+    for cond in _PRED_X_REG_CONDS:
+        for thr in _PRED_X_REG_THRS:
+            for dest in _PRED_X_REG_DEST:
+                for op in _PRED_X_REG_OPS:
+                    bins.append(f"{cond}/{thr}/dest={dest}/op={op}")
+    return bins
+
+
+def synthesize_pred_x_reg(bin_key: str) -> ProbeSpec | None:
+    parts = bin_key.split("/")
+    if len(parts) != 4:
+        return None
+    cond, thr_s, dest_s, op_s = parts
+    if cond not in _PRED_X_REG_CONDS:
+        return None
+    try:
+        thr = int(thr_s)
+    except ValueError:
+        return None
+    if not dest_s.startswith("dest=") or not op_s.startswith("op="):
+        return None
+    dest = dest_s[5:]
+    op = op_s[3:]
+    if dest not in _PRED_X_REG_DEST or op not in _PRED_X_REG_OPS:
+        return None
+    # Build op_text using `dest` as destination AND first source so a
+    # write-after-write hazard exists between the predicated guard and
+    # the body — this is precisely the surface where the R5-conflict
+    # bug lives.  mad needs three sources; everything else is two.
+    if op == "mad.lo.u32":
+        op_text = f"mad.lo.u32 {dest}, %r0, 7, {dest}"
+    else:
+        op_text = f"{op} {dest}, {dest}, %r0"
+    return ProbeSpec(
+        template_id="predicated_alu",
+        target_op=op,
+        operand_spec={"op_text": op_text, "pred_cond": cond, "pred_thr": thr,
+                      "init_acc": 0},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Axis: kernel_corpus
+#   Real-world PTX kernels mirroring VortexSTARK's hot paths.  Bins are
+#   the basenames of files in workbench/probe/kernel_corpus/ so dropping
+#   a new .ptx file in that directory grows the corpus without code
+#   changes.  Hits here are directly actionable (production codegen
+#   gaps) because the kernels match shapes Forge actually emits.
+# ---------------------------------------------------------------------------
+
+def axis_kernel_corpus_bins() -> list[str]:
+    from pathlib import Path
+    corpus_dir = Path(__file__).parent / "kernel_corpus"
+    if not corpus_dir.exists():
+        return []
+    return sorted(p.stem for p in corpus_dir.glob("*.ptx"))
+
+
+def synthesize_kernel_corpus(bin_key: str) -> ProbeSpec | None:
+    return ProbeSpec(
+        template_id="kernel_corpus",
+        target_op="kernel",   # not a real PTX op; runner falls back to oracle
+        operand_spec={"kernel": bin_key},
+    )
+
+
 def axis_regression_bins() -> list[str]:
     return [f"edge_{r[0]}" for r in _regression_rows()]
 
@@ -1203,6 +1288,12 @@ AXES: dict[str, tuple[Callable[[], list[str]],
     "mbarrier":           (axis_mbarrier_bins,         synthesize_mbarrier),
     "cvta":               (axis_cvta_bins,             synthesize_cvta),
     "auto_dispatch":      (axis_auto_dispatch_bins,    synthesize_auto_dispatch),
+    # 2D axis-pair sweeps (interaction terms — the cells where 1D
+    # coverage is structurally blind to the bug shape):
+    "pred_x_reg":         (axis_pred_x_reg_bins,       synthesize_pred_x_reg),
+    # Real-world kernel corpus: hits translate directly to production
+    # codegen quality (Forge-emitted kernel paths in VortexSTARK).
+    "kernel_corpus":      (axis_kernel_corpus_bins,    synthesize_kernel_corpus),
     "regression":         (axis_regression_bins,       synthesize_regression),
 }
 

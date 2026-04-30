@@ -1,0 +1,41 @@
+// Real-world shape: bitwise mix that ptxas typically merges into a
+// single LOP3 instruction via its bit-table optimizer.  Our codegen
+// covers LOP3, but this is exactly the pattern where ptxas's peephole
+// catalog has historically been ahead of ours.  Kernel writes the mix
+// XOR'd with tid so each thread gets a distinct (but deterministic)
+// output.
+.version 8.0
+.target sm_120
+.address_size 64
+.visible .entry probe(.param .u64 p_out, .param .u32 n)
+{
+    .reg .u32 %tid, %nv, %a, %b, %c, %t, %r;
+    .reg .u64 %p, %off, %pg;
+    .reg .pred %guard;
+
+    mov.u32 %tid, %tid.x;
+    ld.param.u32 %nv, [n];
+    setp.ge.u32 %guard, %tid, %nv;
+    @%guard ret;
+
+    mov.u32 %a, 0xCAFEBABE;
+    mov.u32 %b, 0x12345678;
+    mov.u32 %c, 0xDEADBEEF;
+
+    // Majority(a, b, c) = (a & b) | (b & c) | (c & a)
+    // Followed by XOR-with-a, which is the LOP3 truth-table 0x96.
+    and.b32 %r, %a, %b;
+    and.b32 %t, %b, %c;
+    or.b32  %r, %r, %t;
+    and.b32 %t, %c, %a;
+    or.b32  %r, %r, %t;
+    xor.b32 %r, %r, %a;
+    xor.b32 %r, %r, %tid;
+
+    ld.param.u64 %p, [p_out];
+    mul.wide.u32 %off, %tid, 4;
+    add.u64 %pg, %p, %off;
+    cvta.to.global.u64 %pg, %pg;
+    st.global.u32 [%pg], %r;
+    ret;
+}

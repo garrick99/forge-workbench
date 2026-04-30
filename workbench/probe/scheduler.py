@@ -102,6 +102,84 @@ def iter_unfilled(db: ProbeDB,
             break
 
 
+class _AxisBandit:
+    """Epsilon-greedy + UCB1 hybrid over coverage axes.
+
+    Reward signal is hit-rate per axis: a hit (byte_diff, gpu_incorrect,
+    or perf-delta >= threshold) gives +1, every other probe gives 0.
+    The bandit naturally drifts toward axes whose cells produce signal.
+
+    Cold start is bucketed: every axis must be tried at least once
+    before UCB1 takes over.  On each pick, with probability `eps` we
+    take a uniform-random axis instead — pure exploration to keep the
+    bandit honest when reward distributions drift over time (e.g.
+    after a fix lands, an axis that was hot might cool off).
+    """
+
+    def __init__(self, axis_pool: list[str], seed: int = 0,
+                 epsilon: float = 0.30):
+        self.axes = list(axis_pool)
+        self.rng = random.Random(seed)
+        self.eps = epsilon
+        self.trials = {a: 0 for a in self.axes}
+        self.rewards = {a: 0.0 for a in self.axes}
+
+    def pick(self) -> str:
+        if self.rng.random() < self.eps:
+            return self.rng.choice(self.axes)
+        cold = [a for a in self.axes if self.trials[a] == 0]
+        if cold:
+            return self.rng.choice(cold)
+        total = sum(self.trials.values())
+        import math
+        ln_total = math.log(total) if total > 0 else 0.0
+        def score(a):
+            mean = self.rewards[a] / self.trials[a]
+            bound = math.sqrt(2 * ln_total / self.trials[a])
+            return mean + bound
+        return max(self.axes, key=score)
+
+    def update(self, axis: str, reward: float):
+        if axis in self.trials:
+            self.trials[axis] += 1
+            self.rewards[axis] += reward
+
+    def top_arms(self, k: int = 5) -> list[tuple[str, int, float]]:
+        rows = [(a, self.trials[a],
+                 self.rewards[a] / max(self.trials[a], 1))
+                for a in self.axes]
+        rows.sort(key=lambda r: -r[2])
+        return rows[:k]
+
+
+def iter_bandit(db: ProbeDB, axes: list[str] | None,
+                bandit: _AxisBandit, seed: int = 0
+                ) -> Iterator[tuple[str, str, ProbeSpec]]:
+    """Soak-style mutator driven by a bandit's axis pick.  Same shape as
+    iter_soak but the axis distribution is non-uniform — biased toward
+    axes that have been producing signal.  The caller must hand the
+    `bandit` to this function and call `bandit.update(axis, reward)`
+    after each probe lands."""
+    rng = random.Random(seed)
+    while True:
+        axis = bandit.pick()
+        if axes and axis not in axes:
+            # caller restricted axes; fall back to a uniform pick within set
+            axis = rng.choice(axes)
+        bins_fn, syn_fn = AXES[axis]
+        bins = bins_fn()
+        if not bins:
+            continue
+        bin_key = rng.choice(bins)
+        spec = syn_fn(bin_key)
+        if spec is None:
+            continue
+        # Tag the bin so coverage stays unique even if many bandit picks
+        # land on the same underlying bin_key.
+        soak_key = f"{bin_key}/bandit/{seed}/{rng.randrange(1<<32):08x}"
+        yield axis, soak_key, spec
+
+
 def iter_soak(db: ProbeDB, axes: list[str] | None = None,
               seed: int = 0) -> Iterator[tuple[str, str, ProbeSpec]]:
     """After coverage is saturated, keep producing probes by randomly
@@ -221,6 +299,62 @@ def probe_loop(db: ProbeDB,
     respawn_requested = False
     RESPAWN_POLL_EVERY = 250    # check git HEAD + resolutions every N probes
 
+    # Greybox feedback: when a probe hits (byte_diff, gpu_incorrect, or
+    # >=PERF_RATIO perf delta), spawn N neighbors that perturb the
+    # operand_spec by ±1 from the hit cell.  libFuzzer-style coverage
+    # feedback — most bug surface is interaction between adjacent cells,
+    # so amplifying every hit is high EV.  Capped queue keeps a hit
+    # cluster from starving the main iterator.
+    hit_queue: list[tuple[str, str, ProbeSpec]] = []
+    HIT_QUEUE_CAP = 500
+    NEIGHBORS_PER_HIT = 10
+    PERF_DELTA_MIN_MS = 0.10    # only probes faster/slower by >= 100us
+    PERF_DELTA_RATIO = 3.0      # AND ≥3x — keeps sub-ms noise out of the queue
+    n_hits = 0
+    rng_grey = random.Random(hash(("greybox", soak_seed)) & 0xFFFFFFFF)
+    BOUNDARY = (0, 1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128,
+                255, 256, 0xFF, 0xFFFF, 0x10000, 0x7FFF, 0x8000,
+                0x7FFFFFFF, 0x80000000, 0xFFFFFFFF,
+                0xAAAAAAAA, 0x55555555,
+                0xDEADBEEF, 0xCAFEBABE)
+
+    def _spawn_neighbors(spec: ProbeSpec, axis: str, bin_key: str):
+        """Generate up to NEIGHBORS_PER_HIT mutated specs around `spec`
+        and append onto hit_queue.  Each neighbor perturbs exactly one
+        operand_spec field (±1, ±2, or boundary)."""
+        if len(hit_queue) >= HIT_QUEUE_CAP:
+            return
+        budget = min(NEIGHBORS_PER_HIT, HIT_QUEUE_CAP - len(hit_queue))
+        for i in range(budget):
+            ospec = dict(spec.operand_spec or {})
+            keys = [k for k in ospec
+                    if isinstance(ospec[k], int)
+                    or (isinstance(ospec[k], str) and ospec[k].lstrip("-").isdigit())]
+            if not keys:
+                # nothing numeric to perturb — try a boundary substitution
+                # on the first int-like field if it exists, else give up
+                return
+            k = rng_grey.choice(keys)
+            v = ospec[k]
+            if isinstance(v, str):
+                base = int(v)
+                ospec[k] = str(base + rng_grey.choice([-1, 1, -2, 2]))
+            else:
+                if rng_grey.random() < 0.4:
+                    ospec[k] = rng_grey.choice(BOUNDARY)
+                else:
+                    ospec[k] = (v + rng_grey.choice([-1, 1, -2, 2])) & 0xFFFFFFFF
+            new_spec = ProbeSpec(
+                template_id=spec.template_id,
+                target_op=spec.target_op,
+                operand_spec=ospec,
+                pre_context=list(spec.pre_context or []),
+                post_context=list(spec.post_context or []),
+            )
+            tag = rng_grey.randrange(1 << 32)
+            neighbor_key = f"{bin_key}/hit/{i:02d}/{tag:08x}"
+            hit_queue.append((axis, neighbor_key, new_spec))
+
     # Clamp workers to safe range.  >1 enables parallel compile; GPU
     # remains single-threaded (CUDAContext is not thread-safe).
     workers_clamped = max(1, min(MAX_WORKERS, int(workers)))
@@ -282,19 +416,41 @@ def probe_loop(db: ProbeDB,
             respawn_requested = True
         return respawn_requested
 
-    def _record(probe_id: int, axis: str, bin_key: str):
-        nonlocal n, n_match, n_correct, n_byte_diff, n_incorrect
+    def _record(probe_id: int, axis: str, bin_key: str,
+                spec: ProbeSpec | None = None):
+        nonlocal n, n_match, n_correct, n_byte_diff, n_incorrect, n_hits
         db.mark_covered(axis, bin_key, probe_id)
         n += 1
         row = db.query(
-            "SELECT target_byte_match, gpu_correct FROM probes WHERE probe_id = ?",
+            "SELECT target_byte_match, gpu_correct, "
+            "       ours_runtime_ms_mean, ptxas_runtime_ms_mean "
+            "FROM probes WHERE probe_id = ?",
             (probe_id,))
+        is_hit = False
         if row:
-            bm, gc = row[0]
+            bm, gc, ours_ms, ptxas_ms = row[0]
             if bm == 1: n_match += 1
             if gc == 1: n_correct += 1
             if bm == 0: n_byte_diff += 1
             if gc == 0: n_incorrect += 1
+            # Greybox feedback: this is a hit if bytes differ, gpu disagrees,
+            # OR perf shows a meaningful delta.  Skip neighbor-spawning when
+            # spawning would just rediscover synthetic bins (axis tagged
+            # 'regression' is for verify-after-fix, not exploration; and
+            # neighbor-derived bins shouldn't recurse).
+            if bm == 0 or gc == 0:
+                is_hit = True
+            elif (ours_ms is not None and ptxas_ms is not None
+                  and abs(ours_ms - ptxas_ms) >= PERF_DELTA_MIN_MS):
+                ratio = max(ours_ms, ptxas_ms) / max(min(ours_ms, ptxas_ms), 1e-6)
+                if ratio >= PERF_DELTA_RATIO:
+                    is_hit = True
+        if (is_hit and spec is not None and axis != "regression"
+                and "/hit/" not in bin_key):
+            _spawn_neighbors(spec, axis, bin_key)
+            n_hits += 1
+        if bandit is not None:
+            bandit.update(axis, 1.0 if is_hit else 0.0)
             # Auto-resolve detection: if this probe came from the
             # regression axis AND it just passed, flag the corresponding
             # edge_case as resolved-pending-confirm.  Doesn't change the
@@ -321,8 +477,23 @@ def probe_loop(db: ProbeDB,
             _verify_pending_resolutions()
             _maybe_respawn()
 
+    def _greybox_wrap(it):
+        """Yield from hit_queue first, then from the underlying iterator.
+        The queue gets refilled inside _record when a probe hits, so
+        this naturally interleaves discovery with neighbor exploration.
+        Stops when both the queue is empty AND `it` is exhausted."""
+        while True:
+            if hit_queue:
+                yield hit_queue.pop()
+                continue
+            try:
+                yield next(it)
+            except StopIteration:
+                if not hit_queue:
+                    return
+
     def _drive_serial(it):
-        for axis, bin_key, spec in it:
+        for axis, bin_key, spec in _greybox_wrap(it):
             if deadline and time.time() >= deadline:
                 return False
             if max_probes is not None and n >= max_probes:
@@ -330,13 +501,14 @@ def probe_loop(db: ProbeDB,
             if respawn_requested:
                 return False
             probe_id = run_probe(spec, db, ctx=ctx, gpu=gpu)
-            _record(probe_id, axis, bin_key)
+            _record(probe_id, axis, bin_key, spec)
         return True
 
     def _drive_parallel(it):
         """Compile in a thread pool, run+insert serially on the GPU.
         GPU is touched only on the main thread.  DB writes are serial
         through SQLite WAL.  No multi-process, no multi-context."""
+        it = _greybox_wrap(it)
         from concurrent.futures import ThreadPoolExecutor
         # Chunk size balances pool fill vs deadline responsiveness.
         # Each chunk: pre-compile up to `workers_clamped * 4` specs in
@@ -376,25 +548,46 @@ def probe_loop(db: ProbeDB,
                         return False
                     compiled = fut.result()
                     probe_id = run_compiled(compiled, db, ctx=ctx, gpu=gpu)
-                    _record(probe_id, a, b)
+                    _record(probe_id, a, b, compiled.get("spec"))
         finally:
             pool.shutdown(wait=True)
         return True
 
     _drive = _drive_parallel if workers_clamped > 1 else _drive_serial
 
+    # Bandit mode: opt-in via MOWER_BANDIT=1.  Replaces the uniform-random
+    # soak iterator with an epsilon-greedy + UCB1 bandit over axes —
+    # naturally drifts probe budget toward axes producing hits without
+    # losing the explore floor (eps=0.30).
+    use_bandit = os.environ.get("MOWER_BANDIT", "0") == "1"
+    bandit: _AxisBandit | None = None
+    if use_bandit:
+        axis_pool = list(axes) if axes else [a for a in AXES if a != "regression"]
+        bandit = _AxisBandit(axis_pool, seed=soak_seed)
+        print(f"[scheduler] bandit ENABLED over {len(axis_pool)} axes "
+              f"(epsilon={bandit.eps})")
+
     try:
         # First fill all unfilled bins (coverage_greedy).
         finished = _drive(iter_unfilled(db, axes=axes))
         # If soak requested AND we still have time/probe budget, keep going
-        # with randomized variants until deadline / max_probes.
+        # with randomized variants (or bandit-guided picks) until deadline.
         if soak and finished:
-            _drive(iter_soak(db, axes=axes, seed=soak_seed))
+            if bandit is not None:
+                _drive(iter_bandit(db, axes=axes, bandit=bandit, seed=soak_seed))
+            else:
+                _drive(iter_soak(db, axes=axes, seed=soak_seed))
     finally:
         if ctx is not None:
             ctx.close()
 
     elapsed = time.time() - t_start
+    if bandit is not None:
+        top = bandit.top_arms(k=5)
+        if top:
+            print("[scheduler] bandit top arms (axis, trials, hit_rate):")
+            for a, t, hr in top:
+                print(f"  {a:30s}  n={t:6d}  hit_rate={hr:.3f}")
     return {
         "probes_run": n,
         "byte_match": n_match,
@@ -403,6 +596,8 @@ def probe_loop(db: ProbeDB,
         "gpu_incorrect": n_incorrect,
         "elapsed_s": elapsed,
         "rate_per_s": n / max(elapsed, 1e-3),
+        "hits_amplified": n_hits,
+        "bandit_top_arms": bandit.top_arms(k=5) if bandit else None,
         "respawn_requested": respawn_requested,
         "startup_commit": startup_head,
     }

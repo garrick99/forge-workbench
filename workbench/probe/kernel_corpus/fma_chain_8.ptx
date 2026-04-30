@@ -1,0 +1,42 @@
+// Real-world shape: 8 chained FMAs.  This is the inner-loop pattern of
+// many ML/HPC reductions and tests the scheduler's handling of a tight
+// dependency chain (each FMA depends on the previous result) plus
+// register-allocation pressure across constants.
+.version 8.0
+.target sm_120
+.address_size 64
+.visible .entry probe(.param .u64 p_out, .param .u32 n)
+{
+    .reg .u32 %tid, %nv, %ti;
+    .reg .f32 %x, %y, %a, %b, %c, %r;
+    .reg .u64 %p, %off, %pg;
+    .reg .pred %guard;
+
+    mov.u32 %tid, %tid.x;
+    ld.param.u32 %nv, [n];
+    setp.ge.u32 %guard, %tid, %nv;
+    @%guard ret;
+
+    cvt.rn.f32.u32 %x, %tid;
+    mov.f32 %y, 0f3F800000;
+    mov.f32 %a, 0f3FC00000;
+    mov.f32 %b, 0f40000000;
+    mov.f32 %c, 0f3F000000;
+
+    fma.rn.f32 %r, %x, %a, %b;
+    fma.rn.f32 %r, %r, %a, %c;
+    fma.rn.f32 %r, %r, %b, %a;
+    fma.rn.f32 %r, %r, %c, %b;
+    fma.rn.f32 %r, %r, %a, %c;
+    fma.rn.f32 %r, %r, %b, %a;
+    fma.rn.f32 %r, %r, %c, %b;
+    fma.rn.f32 %r, %r, %a, %y;
+
+    cvt.rzi.u32.f32 %ti, %r;
+    ld.param.u64 %p, [p_out];
+    mul.wide.u32 %off, %tid, 4;
+    add.u64 %pg, %p, %off;
+    cvta.to.global.u64 %pg, %pg;
+    st.global.u32 [%pg], %ti;
+    ret;
+}
