@@ -174,22 +174,61 @@ def iter_bandit(db: ProbeDB, axes: list[str] | None,
         spec = syn_fn(bin_key)
         if spec is None:
             continue
-        # Tag the bin so coverage stays unique even if many bandit picks
-        # land on the same underlying bin_key.
+        # Mutate operand_spec so the bandit produces a fresh PTX (and
+        # therefore a fresh ptx_sha that won't dedup against existing
+        # rows).  Without this, every bandit pick would just rediscover
+        # the canonical spec for (axis, bin_key) and INSERT OR IGNORE
+        # would throw it away.
+        new_spec = _mutate_spec(spec, rng)
         soak_key = f"{bin_key}/bandit/{seed}/{rng.randrange(1<<32):08x}"
-        yield axis, soak_key, spec
+        yield axis, soak_key, new_spec
+
+
+_SOAK_BOUNDARY = (
+    0, 1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128,
+    255, 256, 0xFF, 0xFFFF, 0x10000, 0x7FFF, 0x8000,
+    0x7FFFFFFF, 0x80000000, 0xFFFFFFFF,
+    0x7FFFFFFE, 0x80000001,
+    0xAAAAAAAA, 0x55555555, 0xCCCCCCCC, 0x33333333,
+    0xDEADBEEF, 0xCAFEBABE,
+)
+
+
+def _mutate_spec(spec: ProbeSpec, rng: random.Random) -> ProbeSpec:
+    """Return a fresh ProbeSpec with operand_spec values perturbed.
+    60% boundary-biased, 40% uniform.  Used by iter_soak and iter_bandit
+    so the bandit's axis pick translates into a *new* PTX (different
+    ptx_sha) instead of dedup'ing on UNIQUE(template_id, ptx_sha)."""
+    os_d = dict(spec.operand_spec or {})
+
+    def _mut() -> int:
+        return (rng.choice(_SOAK_BOUNDARY) if rng.random() < 0.6
+                else rng.randrange(0, 0xFFFFFFFF))
+
+    if "imm" in os_d:       os_d["imm"]       = _mut()
+    if "gap" in os_d:       os_d["gap"]       = rng.randrange(0, 32)
+    if "pred_thr" in os_d:  os_d["pred_thr"]  = rng.randrange(0, 256)
+    if "init_acc" in os_d:  os_d["init_acc"]  = _mut()
+    if "init_lo" in os_d:   os_d["init_lo"]   = _mut()
+    if "init_hi" in os_d:   os_d["init_hi"]   = _mut()
+    if "arg" in os_d:       os_d["arg"]       = _mut()
+    # op_text-shaped specs aren't structurally mutable here; the
+    # structured numeric fields above carry most of the variant
+    # surface, and op_text axes get explored via their bin enumeration.
+    return ProbeSpec(
+        template_id=spec.template_id,
+        target_op=spec.target_op,
+        operand_spec=os_d,
+        pre_context=list(spec.pre_context or []),
+        post_context=list(spec.post_context or []),
+    )
 
 
 def iter_soak(db: ProbeDB, axes: list[str] | None = None,
               seed: int = 0) -> Iterator[tuple[str, str, ProbeSpec]]:
     """After coverage is saturated, keep producing probes by randomly
-    perturbing operand_spec values.  For each axis we pick a random bin,
-    synthesize the spec, then mutate one of:
-      - imm value:   uniform in 2^32, or boundary (0, 1, MAX, sign-flip)
-      - gap:         random in 0..32
-      - pred_thr:    random in 0..256
-      - init_acc:    random in 2^32
-    The bin_key is tagged `<bin>/soak/<seed>` so coverage stays unique."""
+    perturbing operand_spec values.  Bin_key tagged `<bin>/soak/<seed>`
+    so coverage stays unique even though many soak picks share base bins."""
     rng = random.Random(seed)
     axis_pool = list(axes) if axes else list(AXES.keys())
     while True:
@@ -202,48 +241,7 @@ def iter_soak(db: ProbeDB, axes: list[str] | None = None,
         spec = syn_fn(bin_key)
         if spec is None:
             continue
-
-        # Mutate the spec.  We don't deep-copy (ProbeSpec is a dataclass);
-        # build a fresh operand_spec dict.
-        os = dict(spec.operand_spec or {})
-        # Boundary table — sign bits, max/min signed, mask edges, common
-        # bit-fiddle constants.  60% bias toward boundaries; 40% uniform.
-        boundary = (
-            0, 1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128,
-            255, 256, 0xFF, 0xFFFF, 0x10000, 0x7FFF, 0x8000,
-            0x7FFFFFFF, 0x80000000, 0xFFFFFFFF,            # signed/unsigned bounds
-            0x7FFFFFFE, 0x80000001,                          # bounds neighbours
-            0xAAAAAAAA, 0x55555555, 0xCCCCCCCC, 0x33333333, # alternating patterns
-            0xDEADBEEF, 0xCAFEBABE,                          # arbitrary witnesses
-        )
-        def _mut(k):
-            return rng.choice(boundary) if rng.random() < 0.6 \
-                   else rng.randrange(0, 0xFFFFFFFF)
-        if "imm" in os:
-            os["imm"] = _mut("imm")
-        if "gap" in os:
-            os["gap"] = rng.randrange(0, 32)
-        if "pred_thr" in os:
-            os["pred_thr"] = rng.randrange(0, 256)
-        if "init_acc" in os:
-            os["init_acc"] = _mut("init_acc")
-        if "init_lo" in os:
-            os["init_lo"] = _mut("init_lo")
-        if "init_hi" in os:
-            os["init_hi"] = _mut("init_hi")
-        if "arg" in os:
-            os["arg"] = _mut("arg")
-        # If op_text contains an integer literal, we skip mutation (would
-        # need a parser) — the structured fields above carry most variants.
-
-        new_spec = ProbeSpec(
-            template_id=spec.template_id,
-            target_op=spec.target_op,
-            operand_spec=os,
-            pre_context=list(spec.pre_context),
-            post_context=list(spec.post_context),
-        )
-        # Soak bins use a synthetic key so coverage table doesn't choke.
+        new_spec = _mutate_spec(spec, rng)
         soak_key = f"{bin_key}/soak/{seed}/{rng.randrange(1<<32):08x}"
         yield axis, soak_key, new_spec
 
