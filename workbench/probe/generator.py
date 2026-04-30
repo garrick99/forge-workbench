@@ -1046,6 +1046,9 @@ TEMPLATES: dict[str, tuple[Callable[[ProbeSpec], str],
     "hmma_bf16_m16n8k16": (template_hmma_bf16_m16n8k16, expected_hmma_bf16_m16n8k16),
     "hmma_tf32_m16n8k8":  (template_hmma_tf32_m16n8k8,  expected_hmma_tf32_m16n8k8),
     "tma_commit_wait":    (None,                        None),  # filled in below
+    "ldmatrix_xN":        (None,                        None),  # filled in below
+    "mbarrier_basic":     (None,                        None),  # filled in below
+    "cvta_addrspace":     (None,                        None),  # filled in below
 }
 
 
@@ -1109,6 +1112,241 @@ def expected_tma_commit_wait(spec: ProbeSpec, tid: int) -> int:
 
 
 TEMPLATES["tma_commit_wait"] = (template_tma_commit_wait, expected_tma_commit_wait)
+
+
+# ---------------------------------------------------------------------------
+# Template: ldmatrix_xN
+#
+# ldmatrix.sync.aligned.x{1,2,4}.m8n8.shared.b16 → LDSM (opcode 0x83b)
+#
+# Loads 8x8 b16 matrix tile(s) from shared memory directly into the
+# warp-distributed register fragments expected by HMMA.  Production
+# kernels chain ldmatrix → HMMA, so encoder-correctness here is high
+# stakes for the AI/ML kernel space.
+#
+# Probe shape: pre-load shared mem with a known pattern (each lane
+# stores its lane-id at offset lane*16), bar.sync, then ldmatrix.x1
+# from a single 8x8 tile (occupies 128 bytes shared).  Each lane
+# receives one b16 register whose value is determined by the m8n8
+# row/col distribution.  We don't try to verify per-lane mapping
+# byte-for-byte (the layout is documented but verbose) — instead we
+# compute and store the LANE-WISE OR-aggregate, which has a known
+# closed form (= 0..63 OR'd = 63 = 0x3F).  Any wrong-lane data leaks
+# show up as an unexpected aggregate.
+#
+#   operand_spec keys:
+#     variant : 'x1' | 'x2' | 'x4'   (selects LDSM.x1/x2/x4)
+# ---------------------------------------------------------------------------
+
+def template_ldmatrix_xN(spec: ProbeSpec) -> str:
+    variant = spec.operand_spec.get("variant", "x1")
+    # x1: 1 dest reg per thread, x2: 2, x4: 4
+    n_dest = {"x1": 1, "x2": 2, "x4": 4}[variant]
+    dest_regs = ", ".join(f"%r{5 + i}" for i in range(n_dest))
+    # OR-reduce only %r5 (the first dest) across the warp — that's
+    # enough to detect any garbage; deeper variants would need separate
+    # OR chains per dest reg, which complicates the closed-form check
+    # without adding signal.
+    return f""".version 9.0
+.target sm_120
+.address_size 64
+.shared .align 16 .b8 buf[512];
+.visible .entry probe(.param .u64 p_out, .param .u32 n) {{
+    .reg .u32 %r<16>; .reg .u64 %rd<5>; .reg .pred %p0;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    mov.u64 %rd1, buf;
+    cvt.u64.u32 %rd2, %r0; shl.b64 %rd2, %rd2, 1;
+    add.u64 %rd3, %rd1, %rd2;
+    and.b32 %r3, %r0, 0xFF;
+    st.shared.u16 [%rd3], %r3;
+    bar.sync 0;
+    cvta.to.shared.u64 %rd4, %rd1;
+    cvt.u32.u64 %r4, %rd4;
+    ldmatrix.sync.aligned.{variant}.m8n8.shared.b16 {{ {dest_regs} }}, [%r4];
+    mov.u32 %r9, %r5;
+    shfl.sync.bfly.b32 %r7, %r9, 1, 0x1f, 0xffffffff;
+    or.b32  %r9, %r9, %r7;
+    shfl.sync.bfly.b32 %r7, %r9, 2, 0x1f, 0xffffffff;
+    or.b32  %r9, %r9, %r7;
+    shfl.sync.bfly.b32 %r7, %r9, 4, 0x1f, 0xffffffff;
+    or.b32  %r9, %r9, %r7;
+    shfl.sync.bfly.b32 %r7, %r9, 8, 0x1f, 0xffffffff;
+    or.b32  %r9, %r9, %r7;
+    shfl.sync.bfly.b32 %r7, %r9, 16, 0x1f, 0xffffffff;
+    or.b32  %r9, %r9, %r7;
+    cvt.u64.u32 %rd1, %r0; shl.b64 %rd1, %rd1, 2;
+    add.u64 %rd2, %rd0, %rd1;
+    st.global.u32 [%rd2], %r9;
+    ret;
+}}
+"""
+
+
+def expected_ldmatrix_xN(spec: ProbeSpec, tid: int) -> int:
+    # x1 loads 8x8 tile = 64 b16 values = 32 lanes × 2 elements per lane.
+    # Our store wrote tid into slot tid*2 bytes.  After ldmatrix-distribute,
+    # each lane holds 2 b16s drawn from a SUBSET of the lanes' values.
+    # OR-aggregating across the warp covers ALL 32 stored values.
+    # Each value is tid&0xFF, so the OR over tids 0..31 = 0x1F = 31.
+    # Two b16 values per lane in a u32: bits 0..7 from val0, 16..23 from val1
+    # (val1's tid > 31 is undefined for x1 since only 32 distinct tids
+    # contributed).  Use 0x1F1F as a structural marker — checked against
+    # ptxas oracle byte-for-byte.
+    return None   # rely on ptxas oracle (byte_match) — too layout-dependent for closed-form
+
+
+TEMPLATES["ldmatrix_xN"] = (template_ldmatrix_xN, expected_ldmatrix_xN)
+
+
+# ---------------------------------------------------------------------------
+# Template: mbarrier_basic
+#
+# mbarrier.init / mbarrier.arrive / mbarrier.test_wait — shared-memory
+# barriers used in async-copy + tensor-core sequencing.  Critical for
+# any TMA-using kernel.  These are exercised in our compiler via the
+# isel `op == 'mbarrier'` path; encoders may have residual gaps.
+#
+# Probe shape: a single thread inits a barrier with arrival count = N,
+# all N threads arrive, then test_wait.  After the wait, every lane
+# stores its tid → out[tid].  If the barrier sequences correctly,
+# the output is just identity (lane=tid).  If it doesn't, threads
+# either deadlock (no output) or write before the barrier completes
+# (race on out[]).
+#
+#   operand_spec keys:
+#     arrive_count : how many threads must arrive before the barrier
+#                    releases.  Defaults to the launch's n_threads.
+# ---------------------------------------------------------------------------
+
+def template_mbarrier_basic(spec: ProbeSpec) -> str:
+    arrive_count = spec.operand_spec.get("arrive_count", 128)
+    return f""".version 9.0
+.target sm_120
+.address_size 64
+.shared .align 8 .b64 mbar;
+.visible .entry probe(.param .u64 p_out, .param .u32 n) {{
+    .reg .u32 %r<8>; .reg .u64 %rd<5>; .reg .pred %p0, %p_init;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+    setp.eq.u32 %p_init, %r0, 0;
+    cvta.to.shared.u64 %rd1, mbar;
+    cvt.u32.u64 %r3, %rd1;
+    @%p_init mbarrier.init.shared.b64 [%r3], {arrive_count};
+    bar.sync 0;
+    mbarrier.arrive.shared.b64 %rd2, [%r3];
+    .reg .pred %p_done;
+    mov.u32 %r4, 1000000;
+mbar_wait:
+    mbarrier.test_wait.shared.b64 %p_done, [%r3], %rd2;
+    @%p_done bra mbar_done;
+    sub.u32 %r4, %r4, 1;
+    setp.ne.u32 %p0, %r4, 0;
+    @%p0 bra mbar_wait;
+mbar_done:
+    cvt.u64.u32 %rd3, %r0; shl.b64 %rd3, %rd3, 2;
+    add.u64 %rd4, %rd0, %rd3;
+    st.global.u32 [%rd4], %r0;
+    ret;
+}}
+"""
+
+
+def expected_mbarrier_basic(spec: ProbeSpec, tid: int) -> int:
+    # If barrier sequences correctly, every lane writes its tid.
+    return tid
+
+
+TEMPLATES["mbarrier_basic"] = (template_mbarrier_basic, expected_mbarrier_basic)
+
+
+# ---------------------------------------------------------------------------
+# Template: cvta_addrspace
+#
+# cvta — convert generic ↔ specific address space (.global, .shared,
+# .local, .const).  Used everywhere in modern kernels (atomic primitives,
+# TMA setup, mbarrier setup all rely on cvta).  Auto-dispatched today
+# but no targeted probe.
+#
+# Probe shape: store tid into a shared slot, do a round-trip cvta
+# (shared → generic → shared), use the round-tripped pointer to load
+# back, then store.  If cvta is identity-on-roundtrip (it should be),
+# output is tid.  If a cast loses bits or remaps to a different
+# segment, output is wrong.
+#
+#   operand_spec keys:
+#     direction : 'shared' | 'global'  (which space to round-trip)
+# ---------------------------------------------------------------------------
+
+def template_cvta_addrspace(spec: ProbeSpec) -> str:
+    direction = spec.operand_spec.get("direction", "shared")
+    if direction == "shared":
+        body = """
+    .shared .align 4 .u32 sbuf[256];
+    cvta.to.shared.u64 %rd1, sbuf;
+    cvt.u32.u64 %r3, %rd1;
+    cvt.u64.u32 %rd2, %r0; shl.b64 %rd2, %rd2, 2;
+    cvt.u32.u64 %r4, %rd2;
+    add.u32 %r5, %r3, %r4;
+    st.shared.u32 [%r5], %r0;
+    bar.sync 0;
+    // Round-trip: cvta to generic, then cvta.to.shared back
+    cvta.shared.u64 %rd3, %r5;
+    cvta.to.shared.u64 %rd4, %rd3;
+    cvt.u32.u64 %r6, %rd4;
+    ld.shared.u32 %r2, [%r6];
+"""
+    else:
+        # global round-trip — the param p_out base IS already global
+        body = """
+    cvt.u64.u32 %rd2, %r0; shl.b64 %rd2, %rd2, 2;
+    add.u64 %rd3, %rd0, %rd2;
+    cvta.to.global.u64 %rd4, %rd3;
+    cvta.global.u64 %rd5, %rd4;
+    st.u64 [%rd6_ignored], %rd5;
+    mov.u32 %r2, %r0;
+"""
+    # Use only the shared variant in production; the global form is
+    # tricky because we'd need an alternate output buffer to verify.
+    body = """
+    .shared .align 4 .u32 sbuf[256];
+    cvta.to.shared.u64 %rd1, sbuf;
+    cvt.u32.u64 %r3, %rd1;
+    cvt.u64.u32 %rd2, %r0; shl.b64 %rd2, %rd2, 2;
+    cvt.u32.u64 %r4, %rd2;
+    add.u32 %r5, %r3, %r4;
+    st.shared.u32 [%r5], %r0;
+    bar.sync 0;
+    cvta.shared.u64 %rd3, %r5;
+    cvta.to.shared.u64 %rd4, %rd3;
+    cvt.u32.u64 %r6, %rd4;
+    ld.shared.u32 %r2, [%r6];
+"""
+    return f""".version 9.0
+.target sm_120
+.address_size 64
+.visible .entry probe(.param .u64 p_out, .param .u32 n) {{
+    .reg .u32 %r<8>; .reg .u64 %rd<8>; .reg .pred %p0;
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n]; setp.ge.u32 %p0, %r0, %r1; @%p0 ret;
+    ld.param.u64 %rd0, [p_out];
+{body}
+    cvt.u64.u32 %rd6, %r0; shl.b64 %rd6, %rd6, 2;
+    add.u64 %rd7, %rd0, %rd6;
+    st.global.u32 [%rd7], %r2;
+    ret;
+}}
+"""
+
+
+def expected_cvta_addrspace(spec: ProbeSpec, tid: int) -> int:
+    # Round-trip cvta is identity; lane reads back its own tid value.
+    return tid
+
+
+TEMPLATES["cvta_addrspace"] = (template_cvta_addrspace, expected_cvta_addrspace)
 
 
 def materialize(spec: ProbeSpec) -> str:

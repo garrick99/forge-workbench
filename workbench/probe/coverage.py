@@ -344,13 +344,22 @@ def synthesize_atomic_op(bin_key: str) -> ProbeSpec | None:
 # PTX float constants (hex bit-pattern). 0f3F800000 = 1.0, 0fC0000000 = -2.0,
 # 0f40400000 = 3.0, 0f7F800000 = +inf.
 _F32_CONSTS = {
-    "1.0":   "0f3F800000",
-    "0.5":   "0f3F000000",
-    "2.0":   "0f40000000",
-    "3.0":   "0f40400000",
-    "neg1":  "0fBF800000",
-    "tiny":  "0f00800000",   # smallest normal
-    "inf":   "0f7F800000",
+    "1.0":      "0f3F800000",
+    "0.5":      "0f3F000000",
+    "2.0":      "0f40000000",
+    "3.0":      "0f40400000",
+    "neg1":     "0fBF800000",
+    "tiny":     "0f00800000",   # smallest normal
+    "inf":      "0f7F800000",
+    # Corner-case constants — exercise rounding, FTZ, NaN propagation
+    # paths that are rarely hit by typical numeric ranges.  Labels MUST
+    # NOT contain underscores (the f32_alu axis splits bin keys on '_').
+    "neginf":   "0fFF800000",
+    "nan":      "0f7FC00000",   # quiet NaN
+    "negzero":  "0f80000000",
+    "maxfin":   "0f7F7FFFFF",   # largest finite f32
+    "denorm":   "0f00000001",   # smallest subnormal
+    "epsilon":  "0f34000000",   # 2^-23, ulp(1.0)
 }
 
 _F32_OPS = ("add.f32", "sub.f32", "mul.f32", "min.f32", "max.f32")
@@ -534,15 +543,20 @@ def synthesize_selp_op(bin_key: str) -> ProbeSpec | None:
 # ---------------------------------------------------------------------------
 
 _FMA_K1S = {
-    "1.0":   "0f3F800000",
-    "2.0":   "0f40000000",
-    "0.5":   "0f3F000000",
-    "tiny":  "0f00800000",
+    "1.0":     "0f3F800000",
+    "2.0":     "0f40000000",
+    "0.5":     "0f3F000000",
+    "tiny":    "0f00800000",
+    "inf":     "0f7F800000",
+    "nan":     "0f7FC00000",
+    "maxfin":  "0f7F7FFFFF",     # no underscore: bin parser splits on _
 }
 _FMA_K2S = {
-    "0.0":   "0f00000000",
-    "1.0":   "0f3F800000",
-    "neg1":  "0fBF800000",
+    "0.0":      "0f00000000",
+    "1.0":      "0f3F800000",
+    "neg1":     "0fBF800000",
+    "inf":      "0f7F800000",
+    "negzero":  "0f80000000",    # no underscore
 }
 
 
@@ -1064,6 +1078,73 @@ def synthesize_tma(bin_key: str) -> ProbeSpec | None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Axis 23: ldmatrix — load shared→registers in HMMA fragment layout.
+# ---------------------------------------------------------------------------
+
+_LDMATRIX_VARIANTS = ("x1", "x2", "x4")
+
+
+def axis_ldmatrix_bins() -> list[str]:
+    return [f"variant={v}" for v in _LDMATRIX_VARIANTS]
+
+
+def synthesize_ldmatrix(bin_key: str) -> ProbeSpec | None:
+    if not bin_key.startswith("variant="):
+        return None
+    v = bin_key[len("variant="):]
+    if v not in _LDMATRIX_VARIANTS:
+        return None
+    return ProbeSpec(
+        template_id="ldmatrix_xN",
+        target_op=f"ldmatrix.sync.aligned.{v}.m8n8.shared.b16",
+        operand_spec={"variant": v},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Axis 24: mbarrier — shared-mem barrier init/arrive/wait sequencing.
+# ---------------------------------------------------------------------------
+
+_MBARRIER_COUNTS = (1, 8, 32, 64, 128)
+
+
+def axis_mbarrier_bins() -> list[str]:
+    return [f"arrive_count={c}" for c in _MBARRIER_COUNTS]
+
+
+def synthesize_mbarrier(bin_key: str) -> ProbeSpec | None:
+    if not bin_key.startswith("arrive_count="):
+        return None
+    try:
+        c = int(bin_key[len("arrive_count="):])
+    except ValueError:
+        return None
+    return ProbeSpec(
+        template_id="mbarrier_basic",
+        target_op="mbarrier.arrive.shared.b64",
+        operand_spec={"arrive_count": c},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Axis 25: cvta — address-space cast round-trip.
+# ---------------------------------------------------------------------------
+
+def axis_cvta_bins() -> list[str]:
+    return ["shared/roundtrip"]
+
+
+def synthesize_cvta(bin_key: str) -> ProbeSpec | None:
+    if bin_key != "shared/roundtrip":
+        return None
+    return ProbeSpec(
+        template_id="cvta_addrspace",
+        target_op="cvta.to.shared.u64",
+        operand_spec={"direction": "shared"},
+    )
+
+
 def axis_hmma_bins() -> list[str]:
     return list(_HMMA_SHAPES.keys())
 
@@ -1118,6 +1199,9 @@ AXES: dict[str, tuple[Callable[[], list[str]],
     "shared_barrier":     (axis_shared_barrier_bins,   synthesize_shared_barrier),
     "hmma":               (axis_hmma_bins,             synthesize_hmma),
     "tma":                (axis_tma_bins,              synthesize_tma),
+    "ldmatrix":           (axis_ldmatrix_bins,         synthesize_ldmatrix),
+    "mbarrier":           (axis_mbarrier_bins,         synthesize_mbarrier),
+    "cvta":               (axis_cvta_bins,             synthesize_cvta),
     "auto_dispatch":      (axis_auto_dispatch_bins,    synthesize_auto_dispatch),
     "regression":         (axis_regression_bins,       synthesize_regression),
 }
