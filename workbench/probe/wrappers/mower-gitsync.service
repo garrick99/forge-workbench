@@ -1,0 +1,13 @@
+[Unit]
+Description=GreenDragon mower: keep openptxas + forge-workbench clones in lockstep with github/main
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/mower/bin/git_sync.sh
+Restart=always
+RestartSec=30
+KillMode=process
+
+[Install]
+WantedBy=default.target
