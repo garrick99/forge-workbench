@@ -193,6 +193,34 @@ _SOAK_BOUNDARY = (
     0xDEADBEEF, 0xCAFEBABE,
 )
 
+# Integer-literal pattern for op_text mutation.  Lookbehind/lookahead
+# constrain matches to operand-position literals — never matches the
+# digit suffix of register names (`%r2`, `%rd10`, `%f7`) because those
+# digits aren't preceded by whitespace or comma.  Works for decimal
+# (`6`, `-1`) and hex (`0xff`, `0xCAFEBABE`).
+import re as _re
+_INT_LITERAL_RE = _re.compile(
+    r"(?<=[\s,])(-?(?:0x[0-9a-fA-F]+|\d+))(?=[\s,;]|$)")
+
+
+def _mutate_op_text(op_text: str, rng: random.Random) -> str | None:
+    """Swap one integer literal in op_text for a perturbed value.
+    Returns the mutated op_text, or None if no literal was found.
+    Preserves hex vs decimal formatting of the original literal so
+    the result still looks like idiomatic PTX."""
+    matches = list(_INT_LITERAL_RE.finditer(op_text))
+    if not matches:
+        return None
+    m = rng.choice(matches)
+    base = int(m.group(1), 0)   # 0 = auto-detect 0x prefix and sign
+    if rng.random() < 0.4:
+        new_val = rng.choice(_SOAK_BOUNDARY)
+    else:
+        new_val = (base + rng.choice((-1, 1, -2, 2, -4, 4))) & 0xFFFFFFFF
+    is_hex = m.group(1).lstrip("-").lower().startswith("0x")
+    new_lit = f"0x{new_val:x}" if is_hex else str(new_val)
+    return op_text[:m.start()] + new_lit + op_text[m.end():]
+
 
 def _mutate_spec(spec: ProbeSpec, rng: random.Random) -> ProbeSpec:
     """Return a fresh ProbeSpec with operand_spec values perturbed.
@@ -212,9 +240,15 @@ def _mutate_spec(spec: ProbeSpec, rng: random.Random) -> ProbeSpec:
     if "init_lo" in os_d:   os_d["init_lo"]   = _mut()
     if "init_hi" in os_d:   os_d["init_hi"]   = _mut()
     if "arg" in os_d:       os_d["arg"]       = _mut()
-    # op_text-shaped specs aren't structurally mutable here; the
-    # structured numeric fields above carry most of the variant
-    # surface, and op_text axes get explored via their bin enumeration.
+    # op_text-shaped specs: try to swap an integer literal inside the
+    # PTX text so the resulting cubin differs from the canonical bin's.
+    # Without this, soak picks on op_text-only templates would
+    # rediscover the canonical spec every time and INSERT OR IGNORE
+    # would dedup them — the bandit's axis pick would be wasted.
+    if "op_text" in os_d and isinstance(os_d["op_text"], str):
+        mutated_text = _mutate_op_text(os_d["op_text"], rng)
+        if mutated_text is not None:
+            os_d["op_text"] = mutated_text
     return ProbeSpec(
         template_id=spec.template_id,
         target_op=spec.target_op,
@@ -319,22 +353,32 @@ def probe_loop(db: ProbeDB,
     def _spawn_neighbors(spec: ProbeSpec, axis: str, bin_key: str):
         """Generate up to NEIGHBORS_PER_HIT mutated specs around `spec`
         and append onto hit_queue.  Each neighbor perturbs exactly one
-        operand_spec field (±1, ±2, or boundary)."""
+        operand_spec field (±1, ±2, or boundary).  Numeric fields are
+        perturbed directly; op_text strings get an integer-literal
+        swap via _mutate_op_text."""
         if len(hit_queue) >= HIT_QUEUE_CAP:
             return
         budget = min(NEIGHBORS_PER_HIT, HIT_QUEUE_CAP - len(hit_queue))
         for i in range(budget):
             ospec = dict(spec.operand_spec or {})
+            # Catalog mutable fields: numeric (int or stringified-int)
+            # OR an op_text containing at least one integer literal.
             keys = [k for k in ospec
                     if isinstance(ospec[k], int)
-                    or (isinstance(ospec[k], str) and ospec[k].lstrip("-").isdigit())]
+                    or (isinstance(ospec[k], str) and ospec[k].lstrip("-").isdigit())
+                    or (k == "op_text" and isinstance(ospec[k], str)
+                        and _INT_LITERAL_RE.search(ospec[k]))]
             if not keys:
-                # nothing numeric to perturb — try a boundary substitution
-                # on the first int-like field if it exists, else give up
+                # nothing mutable — give up on this hit
                 return
             k = rng_grey.choice(keys)
             v = ospec[k]
-            if isinstance(v, str):
+            if k == "op_text":
+                mutated = _mutate_op_text(v, rng_grey)
+                if mutated is None:
+                    continue   # try a different field next iteration
+                ospec[k] = mutated
+            elif isinstance(v, str):
                 base = int(v)
                 ospec[k] = str(base + rng_grey.choice([-1, 1, -2, 2]))
             else:

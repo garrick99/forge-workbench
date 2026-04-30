@@ -40,6 +40,23 @@ export PATH="/usr/local/cuda/bin:/usr/lib/wsl/lib:$PATH"
 mkdir -p "$LOG_DIR"
 cd "$WORK_DIR"
 
+# Reap orphans from a previous supervisor run.  KillMode=process in the
+# systemd unit (intentional — keeps gpu_throttle's mid-run kills from
+# cascading into a supervisor restart) means systemctl restart only
+# stops the bash supervisor; any python child it spawned keeps running.
+# That orphan would race the new supervisor's child for the same SQLite
+# DB, so we kill any sibling probe-loop pythons before launching ours.
+# Match cmdline contains "probe-loop" AND ppid != $$ (don't kill our
+# own future children — none exist yet at this point anyway).
+for pid in $(pgrep -f "python.*-m workbench probe-loop" || true); do
+    if [[ "$pid" != "$$" ]]; then
+        echo "[supervisor] reaping orphan probe-loop PID=$pid from prior run" \
+            > "$LOG_DIR/supervisor_startup.log"
+        kill "$pid" 2>/dev/null || true
+    fi
+done
+sleep 2  # give SIGTERM a beat to land before we start a new one
+
 RESPAWN_EXIT=99
 TARGET_FILE="$HOME/mower/.workers_target"   # written by gpu_throttle.sh
 STOP_FILE="$HOME/mower/.supervisor_stop"
