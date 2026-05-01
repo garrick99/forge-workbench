@@ -63,8 +63,20 @@ fi
 # is OFF by default — use only if you've vetted the prompt's hard
 # constraints (probe-autofix bakes in: no test-suite skipping, no
 # history rewriting, retry-on-fail with diagnostics).
-"$CLAUDE_BIN" --print < "$PROMPT" 2>&1 | tee "${PROMPT}.transcript"
+#
+# Wrap in `timeout` so a stuck session (e.g. blocked on tool approval
+# that never comes, or an API stall) doesn't burn an hour with 0 CPU
+# and a 0-byte transcript.  --kill-after gives SIGTERM 60s before
+# escalating to SIGKILL.  Default budget matches probe-watch's
+# --dispatch-timeout (1500s = 25min).
+CLAUDE_TIMEOUT="${CLAUDE_TIMEOUT:-1500}"
+timeout --kill-after=60s "${CLAUDE_TIMEOUT}s" \
+    "$CLAUDE_BIN" --print < "$PROMPT" 2>&1 | tee "${PROMPT}.transcript"
 RC=${PIPESTATUS[0]}
+if [[ $RC -eq 124 || $RC -eq 137 ]]; then
+    echo "[dispatch] edge_$EID: claude TIMEOUT after ${CLAUDE_TIMEOUT}s" \
+        | tee -a "${PROMPT}.transcript"
+fi
 
 # Whether the agent succeeded or not, the validation gate (probe-commit)
 # is the source of truth.  If the agent committed + pushed, the post-

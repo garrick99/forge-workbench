@@ -5112,18 +5112,28 @@ def _cmd_probe_watch(args):
                 f.write(f"# autofix-cmd: workbench probe-autofix <eid> "
                         f"--probe-dir <dir> --openptxas-repo <repo>\n")
 
-            # Auto-dispatch: for each new edge, run --dispatch-cmd
-            # with the edge_id as the first argument.  The dispatch
-            # command is responsible for the actual agent invocation
-            # (e.g. claude CLI, anthropic SDK script, or a custom
-            # workflow).  Limit concurrency to --max-concurrent-fixes
-            # so we don't flood the GPU with parallel probe-commit
-            # validation runs.
+            # Auto-dispatch: for each new edge, run --dispatch-cmd with
+            # the edge_id as the first argument.  Two modes:
+            #
+            #   (a) Serial-with-verify (default when max-concurrent-fixes=1):
+            #       Dispatch one edge, run --verify-cmd if set, re-query
+            #       edges that are still 'open', dispatch the next one.
+            #       Side-effect fixes (claude commits a fix that resolves
+            #       multiple edges) get harvested cheaply between
+            #       dispatches — saves claude budget on already-fixed bugs.
+            #
+            #   (b) Parallel (max-concurrent-fixes > 1):
+            #       Submit all to a ThreadPool.  Faster but pays for every
+            #       edge even if upstream fixes have already resolved them.
+            #
+            # In both modes, --max-dispatches-per-cycle caps the number of
+            # claude sessions launched — excess edges remain 'open' and
+            # get picked up next cycle.
             if args.dispatch_cmd:
                 import concurrent.futures as _cf
                 max_par = max(1, args.max_concurrent_fixes)
-                print(f"  dispatching {len(new_rows)} fix agent(s) "
-                      f"(max-concurrent={max_par})")
+                cap = args.max_dispatches_per_cycle
+                serial_with_verify = (max_par == 1 and args.verify_cmd)
 
                 def _run_dispatch(eid: int) -> tuple[int, int, str]:
                     cmd_str = args.dispatch_cmd.replace("{eid}", str(eid))
@@ -5139,13 +5149,79 @@ def _cmd_probe_watch(args):
                     except subprocess.TimeoutExpired:
                         return (eid, -1, f"TIMEOUT after {args.dispatch_timeout}s")
 
-                with _cf.ThreadPoolExecutor(max_workers=max_par) as pool:
-                    futs = [pool.submit(_run_dispatch, eid)
-                            for eid, _, _, _, _ in new_rows]
-                    for fut in _cf.as_completed(futs):
-                        eid, rc, tail = fut.result()
+                def _run_verify() -> int:
+                    """Run --verify-cmd; ignore exit code (verify scripts
+                    often reasonably exit non-zero when nothing changes)."""
+                    if not args.verify_cmd:
+                        return 0
+                    try:
+                        rv = subprocess.run(args.verify_cmd, shell=True,
+                                            capture_output=True, text=True,
+                                            timeout=args.verify_timeout)
+                        # Surface a single summary line if the script printed one.
+                        for line in (rv.stdout or "").splitlines()[-3:]:
+                            if line.strip():
+                                print(f"    verify: {line.strip()[:180]}")
+                        return rv.returncode
+                    except subprocess.TimeoutExpired:
+                        print(f"    verify: TIMEOUT after {args.verify_timeout}s")
+                        return -1
+
+                def _still_open(eids: list[int]) -> list[int]:
+                    """Return the subset of `eids` whose status is still 'open'."""
+                    if not eids:
+                        return []
+                    placeholders = ",".join("?" for _ in eids)
+                    db = ProbeDB(edges_dir)
+                    rows = db.query(
+                        f"SELECT edge_id FROM edge_cases WHERE edge_id IN "
+                        f"({placeholders}) AND status = 'open'", tuple(eids))
+                    db.close()
+                    return [r[0] for r in rows]
+
+                queue = [eid for eid, _, _, _, _ in new_rows]
+                if cap is not None:
+                    print(f"  dispatching up to {cap} of {len(queue)} edges "
+                          f"(serial+verify={serial_with_verify}, "
+                          f"max-concurrent={max_par})")
+                else:
+                    print(f"  dispatching {len(queue)} fix agent(s) "
+                          f"(serial+verify={serial_with_verify}, "
+                          f"max-concurrent={max_par})")
+
+                if serial_with_verify:
+                    # Re-verify before each dispatch; resolved-by-side-effect
+                    # edges drop out of the queue for free.
+                    n_dispatched = 0
+                    while queue:
+                        if cap is not None and n_dispatched >= cap:
+                            print(f"    cap {cap} reached; "
+                                  f"{len(queue)} edge(s) deferred to next cycle")
+                            break
+                        # Run verify BEFORE picking the next edge, so we
+                        # never dispatch on an edge a prior fix resolved.
+                        if n_dispatched > 0:
+                            _run_verify()
+                            queue = _still_open(queue)
+                            if not queue:
+                                print(f"    queue drained by verify after "
+                                      f"{n_dispatched} dispatch(es)")
+                                break
+                        eid = queue.pop(0)
+                        eid, rc, tail = _run_dispatch(eid)
                         marker = "OK" if rc == 0 else f"FAIL({rc})"
                         print(f"    dispatch edge_{eid}: {marker}  {tail}")
+                        n_dispatched += 1
+                else:
+                    # Parallel: cap-truncate, submit all, no verify-between.
+                    if cap is not None:
+                        queue = queue[:cap]
+                    with _cf.ThreadPoolExecutor(max_workers=max_par) as pool:
+                        futs = [pool.submit(_run_dispatch, eid) for eid in queue]
+                        for fut in _cf.as_completed(futs):
+                            eid, rc, tail = fut.result()
+                            marker = "OK" if rc == 0 else f"FAIL({rc})"
+                            print(f"    dispatch edge_{eid}: {marker}  {tail}")
         else:
             print(f"  no new edges (current max edge_id: {pre_max})")
 
@@ -8980,6 +9056,27 @@ def main():
                           help="max parallel fix agents to dispatch per "
                                "cycle (default: 1 — keeps GPU contention "
                                "from validation gates manageable)")
+    p_pwatch.add_argument("--max-dispatches-per-cycle", type=int, default=None,
+                          help="cap the number of fix agents launched per "
+                               "cycle.  Excess edges remain 'open' and the "
+                               "next cycle picks them up (combined with "
+                               "--verify-cmd, side-effect fixes from this "
+                               "cycle's dispatches will resolve some of "
+                               "the deferred edges for free).  Default: "
+                               "unlimited.  Recommended: 2.")
+    p_pwatch.add_argument("--verify-cmd", default=None,
+                          help="shell command to run between sequential "
+                               "dispatches to harvest side-effect "
+                               "resolutions.  Typical use: a script that "
+                               "re-runs the regression probe for every "
+                               "open edge against current openptxas HEAD "
+                               "and marks newly-passing edges as resolved. "
+                               "Only invoked when --max-concurrent-fixes=1.  "
+                               "Saved ~15 of 23 claude sessions on the "
+                               "original backlog drain.")
+    p_pwatch.add_argument("--verify-timeout", type=int, default=180,
+                          help="seconds before aborting --verify-cmd "
+                               "(default: 180)")
     p_pwatch.add_argument("--max-age-hours", type=int, default=None,
                           help="(single-db mode) only file clusters whose "
                                "canonical probe is within the last N hours.  "
