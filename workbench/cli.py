@@ -5364,21 +5364,58 @@ def _cmd_probe_autofix(args):
         if r and r[0][0]:
             ptx_text = db.get_ptx(r[0][0]) or ""
 
-    # Recent fixes for the same target_op or related_bug — useful as
-    # pattern hints for the agent.
+    # Recent fixes related to this bug — pattern hints for the agent.
+    # Layered match so claude sees relevant prior fixes even when the
+    # exact target_op or tag doesn't match: same template_id, same
+    # opcode family (e.g., 'and.b32' shares root cause with 'and.pred'
+    # in many recent fixes), substring of operand_spec, or substring
+    # match on fix_summary.  Each layer is LIMIT 5; dedup'd at the end.
     similar = []
     seen_fix_ids = set()
-    for q, params in [
+    op_family = (target_op or "").split(".")[0] if target_op else None
+    operand_keywords = []
+    if operand_spec_json:
+        # Pull register names + keywords from operand_spec to fuzzy-
+        # match against past fix summaries (e.g. 'R5' from a dest=%r5
+        # spec finds prior R5-conflict fixes).
+        for tok in re.findall(r"%r\d+|R\d+|FG\d+\w*", operand_spec_json):
+            operand_keywords.append(tok)
+    queries: list[tuple[str, tuple]] = [
+        # Layer 1: exact target_op
         ("SELECT fix_id, fixed_at, fix_commit_sha, fix_summary, "
          "       related_bug_tag, bug_pattern "
          "FROM fix_history WHERE target_op = ? "
-         "ORDER BY fixed_at DESC LIMIT 5", (target_op,)),
+         "ORDER BY fixed_at DESC LIMIT 5", (target_op,) if target_op else ()),
+        # Layer 2: exact related_bug_tag
         ("SELECT fix_id, fixed_at, fix_commit_sha, fix_summary, "
          "       related_bug_tag, bug_pattern "
          "FROM fix_history WHERE related_bug_tag = ? "
-         "ORDER BY fixed_at DESC LIMIT 5", (related_bug,)),
-    ]:
-        if not params or not params[0]:
+         "ORDER BY fixed_at DESC LIMIT 5", (related_bug,) if related_bug else ()),
+        # Layer 3: template_id substring in fix_summary OR bug_pattern
+        ("SELECT fix_id, fixed_at, fix_commit_sha, fix_summary, "
+         "       related_bug_tag, bug_pattern "
+         "FROM fix_history WHERE fix_summary LIKE ? "
+         "   OR bug_pattern LIKE ? "
+         "ORDER BY fixed_at DESC LIMIT 5",
+         (f"%{template_id}%", f"%{template_id}%") if template_id else ()),
+        # Layer 4: opcode family (e.g. 'and' matches and.b32, and.pred)
+        ("SELECT fix_id, fixed_at, fix_commit_sha, fix_summary, "
+         "       related_bug_tag, bug_pattern "
+         "FROM fix_history WHERE target_op LIKE ? "
+         "ORDER BY fixed_at DESC LIMIT 5",
+         (f"{op_family}.%",) if op_family else ()),
+    ]
+    # Layer 5: operand_spec keywords (R5, FG56, %r5) in fix_summary —
+    # one query per keyword, LIMIT 3 each.
+    for kw in operand_keywords[:5]:
+        queries.append((
+            "SELECT fix_id, fixed_at, fix_commit_sha, fix_summary, "
+            "       related_bug_tag, bug_pattern "
+            "FROM fix_history WHERE fix_summary LIKE ? "
+            "ORDER BY fixed_at DESC LIMIT 3",
+            (f"%{kw}%",)))
+    for q, params in queries:
+        if not params:
             continue
         for fr in db.query(q, params):
             if fr[0] in seen_fix_ids:
@@ -5458,6 +5495,7 @@ def _cmd_probe_autofix(args):
     L.append(f"    --openptxas-repo {repo} \\")
     L.append(f"    --probe-dir {probe_dir} \\")
     L.append(f"    --resolves {eid} \\")
+    L.append(f"    --corpus-gate-dir C:\\Users\\kraken\\forge\\analysis\\vortex_ntt \\")
     L.append(f'    --message "<short fix description>" \\')
     L.append(f"    --push")
     L.append("```")
@@ -5469,6 +5507,11 @@ def _cmd_probe_autofix(args):
              "The output lists which tests; investigate each.")
     L.append("   - `[3/3] validation surface FAIL`: a mower axis you weren't "
              "targeting regressed.  Your fix has an unintended side-effect.")
+    L.append("   - `[4/4] corpus regression gate FAIL`: a Forge production "
+             "kernel either stopped compiling, lost byte-equivalence with "
+             "ptxas, or grew >10% in instruction count.  Your fix breaks "
+             "real-world codegen — re-investigate (the report will list the "
+             "specific kernels and what regressed).")
     L.append("5. Retry up to **3 attempts**.  If still failing, report what "
              "you tried and why each attempt failed.")
 
@@ -5509,6 +5552,131 @@ def _cmd_probe_autofix(args):
         print(f"  - Manual:              just paste the prompt into a fresh chat")
     else:
         sys.stdout.write(prompt)
+    return 0
+
+
+def _run_corpus_gate(ptx_dir: str, baseline_path: str | None,
+                     update_on_pass: bool = True) -> int:
+    """Compile every .ptx file in `ptx_dir` through openptxas, compute
+    a per-kernel signature (compiles?, ours_cubin_size, ours_n_instr,
+    byte_match_with_ptxas?), and compare against `baseline_path`
+    (a JSON file).  Returns 0 on no regressions, 8 on a regression.
+
+    Regression rules (any of these abort):
+      * a kernel that previously compiled now raises in openptxas
+      * a kernel that previously byte-matched ptxas now diverges
+      * a kernel's instruction count grew by >10%
+
+    On pass with update_on_pass=True, the baseline file is updated to
+    the new state — so a fix that *improves* the corpus (e.g. fixes a
+    previously-failing kernel) becomes the new bar to maintain.
+    """
+    import json as _json
+    import os as _os
+    import re as _re
+    import subprocess as _sp
+    import sys as _sys
+    import tempfile as _tf
+    from pathlib import Path as _Path
+
+    PTXAS = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2\bin\ptxas.exe"
+    NVDISASM = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2\bin\nvdisasm.exe"
+
+    def _instr_count(sass: str) -> int:
+        return sum(1 for ln in sass.splitlines() if "/*" in ln and "*/" in ln)
+
+    def _measure(p: _Path) -> dict:
+        out = {"compiles": False, "byte_match": None,
+               "ours_size": 0, "ours_n": 0, "err": None}
+        ptx_text = p.read_text(encoding="utf-8")
+        try:
+            from sass.pipeline import compile_ptx_source  # type: ignore
+            r = compile_ptx_source(ptx_text)
+            ours_cubin = (next(iter(r.values()))
+                          if isinstance(r, dict) else r)
+            out["compiles"] = True
+            out["ours_size"] = len(ours_cubin)
+        except Exception as e:
+            out["err"] = f"{type(e).__name__}: {str(e)[:120]}"
+            return out
+        # Disasm ours
+        with _tf.NamedTemporaryFile(suffix=".cubin", delete=False) as f:
+            f.write(ours_cubin); cb = f.name
+        try:
+            rd = _sp.run([NVDISASM, "-c", cb], capture_output=True,
+                         text=True, timeout=20)
+            out["ours_n"] = _instr_count(rd.stdout if rd.returncode == 0 else "")
+        finally:
+            _os.unlink(cb)
+        # Compile ptxas + byte-compare (best effort; if ptxas itself
+        # fails, leave byte_match=None).
+        with _tf.TemporaryDirectory() as tmp:
+            cubin_path = _Path(tmp) / "k.cubin"
+            r = _sp.run([PTXAS, "-arch", "sm_120", str(p),
+                         "-o", str(cubin_path)],
+                        capture_output=True, text=True, timeout=60)
+            if r.returncode == 0:
+                out["byte_match"] = (cubin_path.read_bytes() == ours_cubin)
+        return out
+
+    ptx_files = sorted(_Path(ptx_dir).glob("*.ptx"))
+    if not ptx_files:
+        print(f"  corpus gate: no .ptx files in {ptx_dir}; skipping")
+        return 0
+    print(f"\n[4/4] corpus regression gate: {len(ptx_files)} kernel(s)")
+
+    current = {p.stem: _measure(p) for p in ptx_files}
+    baseline = {}
+    if baseline_path and _os.path.exists(baseline_path):
+        try:
+            baseline = _json.loads(_Path(baseline_path).read_text())
+        except Exception as e:
+            print(f"  could not read baseline {baseline_path}: {e}")
+            baseline = {}
+    elif baseline_path:
+        print(f"  no baseline at {baseline_path} — initializing on first pass")
+
+    regressions = []
+    for name, cur in current.items():
+        prev = baseline.get(name)
+        if not prev:
+            print(f"  {name:24s}  NEW  compiles={cur['compiles']}  "
+                  f"byte_match={cur['byte_match']}  n={cur['ours_n']}")
+            continue
+        # Compile regression
+        if prev.get("compiles") and not cur["compiles"]:
+            regressions.append(
+                f"{name}: previously compiled, now FAILS "
+                f"({cur.get('err','?')})")
+            continue
+        # Byte-match regression
+        if prev.get("byte_match") is True and cur.get("byte_match") is False:
+            regressions.append(
+                f"{name}: previously byte-matched ptxas, now diverges")
+            continue
+        # Instruction count growth
+        prev_n = int(prev.get("ours_n") or 0)
+        cur_n = int(cur.get("ours_n") or 0)
+        if prev_n > 0 and cur_n > prev_n * 1.10:
+            regressions.append(
+                f"{name}: instruction count grew {prev_n} -> {cur_n} "
+                f"(+{(cur_n-prev_n)/prev_n*100:.1f}%)")
+            continue
+        # OK — accept any improvement (kernel that started compiling, etc.)
+        marker = ("✓" if cur.get("byte_match") else "·")
+        print(f"  {name:24s}  {marker}  compiles={cur['compiles']}  "
+              f"byte_match={cur['byte_match']}  n={cur['ours_n']}")
+
+    if regressions:
+        print(f"\n  REGRESSIONS ({len(regressions)}):")
+        for r in regressions:
+            print(f"    - {r}")
+        return 8
+
+    if update_on_pass and baseline_path:
+        _Path(baseline_path).parent.mkdir(parents=True, exist_ok=True)
+        _Path(baseline_path).write_text(_json.dumps(current, indent=2))
+        print(f"  baseline updated: {baseline_path}")
     return 0
 
 
@@ -5705,6 +5873,24 @@ def _cmd_probe_commit(args):
             ctx2.close()
     else:
         print(f"\n[3/3] validation surface skipped (use --validation-axes to enable)")
+
+    # 4b. Optional corpus regression gate: compile every Forge-emitted
+    # production kernel through openptxas, compare against the
+    # baseline of (compiles, byte_match, ours_n) per kernel.  Abort if
+    # any kernel that previously compiled now fails, or any kernel
+    # that previously byte-matched ptxas now diverges, or instruction
+    # count grew by >10%.  Catches "correct on the regression probe
+    # but broken on a production shape" before it lands.
+    if args.corpus_gate_dir:
+        baseline = args.corpus_baseline or os.path.join(
+            args.probe_dir, "forge_baseline.json")
+        gate_rc = _run_corpus_gate(args.corpus_gate_dir, baseline,
+                                   update_on_pass=True)
+        if gate_rc != 0:
+            print(f"\nABORT: corpus regression gate failed (rc={gate_rc})")
+            return gate_rc
+    else:
+        print(f"\n[4/4] corpus gate skipped (use --corpus-gate-dir to enable)")
 
     # All gates passed.  Commit + optional push.
     print(f"\n=== validation passed; committing ===")
@@ -9234,6 +9420,17 @@ def main():
                         help="comma-separated mower axes to run as a "
                              "validation surface (e.g. 'pred_composition,hmma'); "
                              "any axis with a regressing probe ABORTs")
+    p_pcom.add_argument("--corpus-gate-dir", default=None,
+                        help="directory of .ptx files to compile-test as a "
+                             "corpus regression gate (typically Forge's "
+                             "emitted production kernels).  Compares against "
+                             "--corpus-baseline; abort if any kernel "
+                             "regresses (compile failure, byte-match loss, "
+                             "or >10%% instruction-count growth).")
+    p_pcom.add_argument("--corpus-baseline", default=None,
+                        help="JSON file storing the per-kernel corpus "
+                             "baseline.  Updated on every successful gate "
+                             "pass.  Default: <probe-dir>/forge_baseline.json")
     p_pcom.add_argument("--no-gpu", action="store_true",
                         help="skip GPU runs (compile-only validation)")
     p_pcom.add_argument("--no-test-suite", action="store_true",
