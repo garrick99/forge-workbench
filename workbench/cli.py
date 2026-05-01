@@ -4890,14 +4890,18 @@ def _file_single_mode_clusters(data_db_path: str, edges_db_path: str,
     if not rows:
         return 0
 
-    # For each cluster, check if edges DB already has a matching open
-    # edge.  If not, INSERT.  We key on (target_op, template_id) since
-    # opcode can be NULL for some probes.
+    # For each cluster, check if edges DB already has a matching edge
+    # in ANY status.  Once a bug class is classified — open, fixed, or
+    # explicitly wontfix — it should never re-surface as a new edge.
+    # The hourly verify_open_edges + the daily reverify_resolved
+    # together catch genuine regressions on resolved cases by flipping
+    # them back to 'open' (which means they DO show up in the dedup
+    # set as 'open' and don't refile, but DO get dispatched on the
+    # next cycle by probe-watch's existing open-edge logic).
     edges = ProbeDB(edges_dir)
     existing = set()
     for op, tmpl in edges.query(
-        "SELECT target_op, template_id FROM edge_cases "
-        "WHERE status IN ('open', 'investigating', 'resolved-pending-verify')"
+        "SELECT target_op, template_id FROM edge_cases"
     ):
         existing.add((op, tmpl))
 
