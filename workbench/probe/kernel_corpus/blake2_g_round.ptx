@@ -1,0 +1,71 @@
+// Real-world shape: one Blake2s G mixing function over four u32 words.
+//   G(a, b, c, d, x, y):
+//     a = a + b + x
+//     d = rotr32(d ^ a, 16)
+//     c = c + d
+//     b = rotr32(b ^ c, 12)
+//     a = a + b + y
+//     d = rotr32(d ^ a, 8)
+//     c = c + d
+//     b = rotr32(b ^ c, 7)
+// Tests add + xor + rotr (lowered to SHF or shl/shr/or) — the pattern
+// at the heart of every Blake2/SHA3 round and used in VortexSTARK's
+// grind path.  Per-thread x, y, initial state varied by tid.
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry probe(.param .u64 p_out, .param .u32 n)
+{
+    .reg .u32 %r<16>;
+    .reg .u64 %rd<4>;
+    .reg .pred %p0;
+
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n];
+    setp.ge.u32 %p0, %r0, %r1;
+    @%p0 ret;
+
+    // Initial state (constants xor'd with tid for per-thread variance)
+    mov.u32     %r2, 0x6a09e667;        // a = blake2 IV0
+    mov.u32     %r3, 0xbb67ae85;        // b = blake2 IV1
+    mov.u32     %r4, 0x3c6ef372;        // c = blake2 IV2
+    mov.u32     %r5, 0xa54ff53a;        // d = blake2 IV3
+    xor.b32     %r2, %r2, %r0;
+    add.u32     %r6, %r0, 0x12345678;   // x
+    add.u32     %r7, %r0, 0xdeadbeef;   // y
+
+    // a = a + b + x
+    add.u32     %r2, %r2, %r3;
+    add.u32     %r2, %r2, %r6;
+    // d = rotr32(d ^ a, 16)
+    xor.b32     %r5, %r5, %r2;
+    shf.r.wrap.b32 %r5, %r5, %r5, 16;
+    // c = c + d
+    add.u32     %r4, %r4, %r5;
+    // b = rotr32(b ^ c, 12)
+    xor.b32     %r3, %r3, %r4;
+    shf.r.wrap.b32 %r3, %r3, %r3, 12;
+    // a = a + b + y
+    add.u32     %r2, %r2, %r3;
+    add.u32     %r2, %r2, %r7;
+    // d = rotr32(d ^ a, 8)
+    xor.b32     %r5, %r5, %r2;
+    shf.r.wrap.b32 %r5, %r5, %r5, 8;
+    // c = c + d
+    add.u32     %r4, %r4, %r5;
+    // b = rotr32(b ^ c, 7)
+    xor.b32     %r3, %r3, %r4;
+    shf.r.wrap.b32 %r3, %r3, %r3, 7;
+
+    // Mix all four words into one u32 output
+    xor.b32     %r8, %r2, %r3;
+    xor.b32     %r9, %r4, %r5;
+    xor.b32     %r8, %r8, %r9;
+
+    ld.param.u64 %rd0, [p_out];
+    mul.wide.u32 %rd1, %r0, 4;
+    add.u64     %rd2, %rd0, %rd1;
+    cvta.to.global.u64 %rd2, %rd2;
+    st.global.u32 [%rd2], %r8;
+    ret;
+}

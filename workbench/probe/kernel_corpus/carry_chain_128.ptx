@@ -1,0 +1,51 @@
+// Real-world shape: 128-bit add via four-limb carry chain
+//   sum = a + b  where a, b, sum are 128-bit.
+// Tests add.cc.u32 + addc.cc.u32 + addc.u32 (the latter terminates the
+// carry chain).  Used wherever big-int arithmetic appears — Montgomery
+// reduction, multi-precision STARK accumulation, RSA-shaped workloads.
+// openptxas's carry-flag tracking is in this critical path; the
+// per-instruction wdep scheduling has historically been a source of
+// codegen bugs.
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry probe(.param .u64 p_out, .param .u32 n)
+{
+    .reg .u32 %r<20>;
+    .reg .u64 %rd<4>;
+    .reg .pred %p0;
+
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n];
+    setp.ge.u32 %p0, %r0, %r1;
+    @%p0 ret;
+
+    // a (128 bits, four limbs) varies by tid
+    add.u32     %r2, %r0, 0x11111111;
+    add.u32     %r3, %r0, 0x22222222;
+    add.u32     %r4, %r0, 0x33333333;
+    add.u32     %r5, %r0, 0x44444444;
+    // b (constant, designed so the chain propagates carries through every limb)
+    mov.u32     %r6, 0xFFFFFFFF;
+    mov.u32     %r7, 0xFFFFFFFF;
+    mov.u32     %r8, 0xFFFFFFFF;
+    mov.u32     %r9, 0x00000001;
+
+    // sum = a + b, four-limb carry chain
+    add.cc.u32  %r10, %r2, %r6;
+    addc.cc.u32 %r11, %r3, %r7;
+    addc.cc.u32 %r12, %r4, %r8;
+    addc.u32    %r13, %r5, %r9;
+
+    // Mix the four sum limbs into one u32
+    xor.b32     %r14, %r10, %r11;
+    xor.b32     %r15, %r12, %r13;
+    xor.b32     %r14, %r14, %r15;
+
+    ld.param.u64 %rd0, [p_out];
+    mul.wide.u32 %rd1, %r0, 4;
+    add.u64     %rd2, %rd0, %rd1;
+    cvta.to.global.u64 %rd2, %rd2;
+    st.global.u32 [%rd2], %r14;
+    ret;
+}

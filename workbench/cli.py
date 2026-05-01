@@ -4949,6 +4949,80 @@ def _file_single_mode_clusters(data_db_path: str, edges_db_path: str,
     return n_filed
 
 
+def _cmd_probe_perf_report(args):
+    """Scan a probe DB for systematic perf gaps (template+target_op
+    where ours is consistently slower than ptxas) and emit a markdown
+    report.  Manual review on each finding — perf fixes are correctness-
+    preserving but high-blast-radius, so this is the triage half of the
+    autofix loop, not the autonomous half.
+
+    Threshold defaults: n>=30 samples, ratio>=2x, gain>=0.05ms.  The
+    report ranks by (ratio * sqrt(n)) so a small-but-systematic gap
+    competes against a large-but-noisy one.
+    """
+    import sqlite3
+    import sys
+    from pathlib import Path
+
+    data_db = Path(args.single_db)
+    if not data_db.exists():
+        print(f"probe-perf-report: --single-db {data_db} not found",
+              file=sys.stderr)
+        return 2
+    conn = sqlite3.connect(f"file:{data_db.resolve()}?mode=ro", uri=True)
+    rows = list(conn.execute("""
+        SELECT template_id, target_op, COUNT(*) AS n,
+               AVG(ours_runtime_ms_mean) AS avg_ours,
+               AVG(ptxas_runtime_ms_mean) AS avg_ptxas,
+               AVG(ours_runtime_ms_mean - ptxas_runtime_ms_mean) AS avg_delta,
+               AVG(ours_runtime_ms_mean) / NULLIF(AVG(ptxas_runtime_ms_mean), 0) AS ratio
+        FROM probes
+        WHERE ours_runtime_ms_mean IS NOT NULL
+          AND ptxas_runtime_ms_mean IS NOT NULL
+        GROUP BY template_id, target_op
+        HAVING n >= ? AND ratio >= ? AND avg_delta >= ?
+        ORDER BY ratio * (n * 1.0) DESC
+        LIMIT ?
+    """, (args.min_n, args.min_ratio, args.min_delta_ms, args.limit)))
+    conn.close()
+
+    out = []
+    out.append(f"# Perf-gap report — {time.strftime('%Y-%m-%dT%H:%M:%S')}")
+    out.append(f"data: `{data_db.name}`  "
+               f"thresholds: n>={args.min_n}, ratio>={args.min_ratio}, "
+               f"delta>={args.min_delta_ms}ms")
+    if not rows:
+        out.append("\n**No systematic perf gaps meet thresholds.** "
+                   "Either ours is on par with ptxas across all sampled "
+                   "cells, or the bandit hasn't accumulated enough "
+                   "samples per cell yet — re-run after another "
+                   "10-100K probes.")
+    else:
+        out.append(f"\n{len(rows)} clusters above threshold, ranked by "
+                   f"ratio × n:\n")
+        out.append("| rank | template | target_op | n | ours ms | ptxas ms | ratio | delta ms |")
+        out.append("|---:|:---|:---|---:|---:|---:|---:|---:|")
+        for i, r in enumerate(rows, 1):
+            tmpl, op, n, o, p, d, ratio = r
+            out.append(f"| {i} | `{tmpl}` | `{op}` | {n} | "
+                       f"{o:.4f} | {p:.4f} | {ratio:.2f}x | {d:+.4f} |")
+        out.append("")
+        out.append("Triage path: `python tools/triage_gap.py <template> "
+                   "<target_op>` on GreenDragon (where the cubins live) "
+                   "for any row of interest — that prints SASS for both "
+                   "and the opcode-level delta.  Fixes need manual "
+                   "review; do **not** auto-dispatch claude on perf "
+                   "gaps (correctness is the autonomous lane).")
+
+    text = "\n".join(out) + "\n"
+    if args.output:
+        Path(args.output).write_text(text, encoding="utf-8")
+        print(f"wrote {args.output} ({len(text)} chars, {len(rows)} clusters)")
+    else:
+        print(text)
+    return 0
+
+
 def _cmd_probe_watch(args):
     """Long-running anomaly watcher: scans probe DB(s) on a fixed
     interval and auto-files newly-detected bug clusters as edge_cases.
@@ -8998,6 +9072,30 @@ def main():
                     "errors; coverage breakdown per axis.")
     p_ps.add_argument("--probe-dir", default=str(DEFAULT_PROBE_DIR))
 
+    # ---- probe-perf-report: scan a snapshot for systematic perf gaps ----
+    p_perf = sub.add_parser(
+        "probe-perf-report",
+        help="emit a markdown report of (template, target_op) clusters "
+             "where ours is systematically slower than ptxas",
+        description="Triage half of the autofix loop.  Scans a probe DB "
+                    "for paired-timing rows, ranks (template, target_op) "
+                    "clusters by perf-gap-strength (ratio * n), writes a "
+                    "markdown table.  Designed to be invoked from the "
+                    "hourly autofix wrapper and appended to the digest "
+                    "for manual review.")
+    p_perf.add_argument("--single-db", required=True,
+                        help="path to a probe DB snapshot to scan")
+    p_perf.add_argument("--output", default=None,
+                        help="write report to this path (default: stdout)")
+    p_perf.add_argument("--min-n", type=int, default=30,
+                        help="minimum sample count per cluster (default: 30)")
+    p_perf.add_argument("--min-ratio", type=float, default=2.0,
+                        help="minimum ours/ptxas ratio (default: 2.0)")
+    p_perf.add_argument("--min-delta-ms", type=float, default=0.05,
+                        help="minimum absolute delta in ms (default: 0.05)")
+    p_perf.add_argument("--limit", type=int, default=20,
+                        help="max clusters to report (default: 20)")
+
     # ---- probe-watch: long-running 30-min harvest watcher ----
     p_pwatch = sub.add_parser(
         "probe-watch",
@@ -9569,6 +9667,8 @@ def main():
         return _cmd_probe_loop(args)
     if args.cmd == "probe-watch":
         return _cmd_probe_watch(args)
+    if args.cmd == "probe-perf-report":
+        return _cmd_probe_perf_report(args)
     if args.cmd == "probe-autofix":
         return _cmd_probe_autofix(args)
     if args.cmd == "probe-commit":

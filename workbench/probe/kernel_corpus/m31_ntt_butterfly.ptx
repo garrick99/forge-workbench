@@ -1,0 +1,67 @@
+// Real-world shape: NTT butterfly in the M31 field (p = 2^31 - 1).
+// One forward butterfly: (a, b) -> (a + omega*b, a - omega*b) mod p.
+// Tests mul.lo.u32 + carry-aware add + sub-with-conditional-add +
+// the classic shr/mask/add reduction pattern.  This is the inner
+// kernel of a stwo-class prover's NTT pass.
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry probe(.param .u64 p_out, .param .u32 n)
+{
+    .reg .u32 %r<16>;
+    .reg .u64 %rd<4>;
+    .reg .pred %p0;
+
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n];
+    setp.ge.u32 %p0, %r0, %r1;
+    @%p0 ret;
+
+    // a, b, omega per-thread (varied by tid so each thread gets a
+    // distinct cell of the butterfly surface)
+    add.u32     %r2, %r0, 1;            // a = tid + 1
+    add.u32     %r3, %r0, 0x5a827999;   // b = tid + omega-ish constant
+    mov.u32     %r4, 0x12345678;        // omega
+
+    // Reduce a, b, omega mod p first
+    and.b32     %r2, %r2, 0x7FFFFFFF;
+    and.b32     %r3, %r3, 0x7FFFFFFF;
+    and.b32     %r4, %r4, 0x7FFFFFFF;
+
+    // omega * b -> 64-bit, low 31 bits + carry on bit 31..62
+    mul.lo.u32  %r5, %r4, %r3;
+    mul.hi.u32  %r6, %r4, %r3;
+
+    // M31 reduction of the 62-bit product: low_31 + 2*high_31
+    // The product fits in 62 bits; reduction = (lo & p) + (lo>>31) + (hi<<1)
+    and.b32     %r7, %r5, 0x7FFFFFFF;
+    shr.b32     %r5, %r5, 31;
+    shl.b32     %r6, %r6, 1;
+    add.u32     %r7, %r7, %r5;
+    add.u32     %r7, %r7, %r6;
+    // Final fold: settle the carry from add (max value < 2*p, single sub safe)
+    and.b32     %r5, %r7, 0x7FFFFFFF;
+    shr.b32     %r7, %r7, 31;
+    add.u32     %r7, %r7, %r5;
+
+    // a + omega*b mod p
+    add.u32     %r8, %r2, %r7;
+    and.b32     %r9, %r8, 0x7FFFFFFF;
+    shr.b32     %r8, %r8, 31;
+    add.u32     %r9, %r9, %r8;
+
+    // a - omega*b mod p (add p, sub, mask)
+    sub.u32     %r10, %r2, %r7;
+    add.u32     %r10, %r10, 0x7FFFFFFF;
+    and.b32     %r10, %r10, 0x7FFFFFFF;
+
+    // XOR the two halves so each thread gets a single u32 dependent on both
+    xor.b32     %r11, %r9, %r10;
+
+    ld.param.u64 %rd0, [p_out];
+    mul.wide.u32 %rd1, %r0, 4;
+    add.u64     %rd2, %rd0, %rd1;
+    cvta.to.global.u64 %rd2, %rd2;
+    st.global.u32 [%rd2], %r11;
+    ret;
+}
