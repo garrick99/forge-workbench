@@ -1,0 +1,36 @@
+// Real-world shape: warp-shuffle butterfly used in NTT/FFT decimation
+// stages.  shfl.sync.bfly.b32 is the SM_120 instruction Forge emits
+// for cross-lane data exchange in circle_ntt_layer / circle_ntt_batch.
+// openptxas's coverage of the shfl.sync family is uneven — surfacing
+// it through the corpus catches encoding/scoreboard bugs.
+.version 9.0
+.target sm_120
+.address_size 64
+.visible .entry probe(.param .u64 p_out, .param .u32 n)
+{
+    .reg .u32 %r<8>;
+    .reg .u64 %rd<4>;
+    .reg .pred %p0, %p_pred;
+
+    mov.u32 %r0, %tid.x;
+    ld.param.u32 %r1, [n];
+    setp.ge.u32 %p0, %r0, %r1;
+    @%p0 ret;
+
+    // Each lane starts with a distinct value, then butterflies with
+    // its xor-partner across stride 1, 2, 4 (3 stages).
+    add.u32     %r2, %r0, 0xCAFE;
+    shfl.sync.bfly.b32 %r3 | %p_pred, %r2, 1, 0x1f, 0xffffffff;
+    add.u32     %r2, %r2, %r3;
+    shfl.sync.bfly.b32 %r3 | %p_pred, %r2, 2, 0x1f, 0xffffffff;
+    xor.b32     %r2, %r2, %r3;
+    shfl.sync.bfly.b32 %r3 | %p_pred, %r2, 4, 0x1f, 0xffffffff;
+    add.u32     %r2, %r2, %r3;
+
+    ld.param.u64 %rd0, [p_out];
+    mul.wide.u32 %rd1, %r0, 4;
+    add.u64     %rd0, %rd0, %rd1;
+    cvta.to.global.u64 %rd0, %rd0;
+    st.global.u32 [%rd0], %r2;
+    ret;
+}
