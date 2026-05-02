@@ -45,6 +45,19 @@ def compile_openptxas(ptx_text: str) -> bytes:
     return next(iter(result.values())) if isinstance(result, dict) else result
 
 
+def compile_openptxas_all(ptx_text: str) -> dict[str, bytes]:
+    """Like compile_openptxas, but returns the full {kernel_name: cubin}
+    dict instead of collapsing to a single arbitrary kernel.  Needed for
+    multi-`.entry` PTX where the per-kernel comparison must be done
+    individually."""
+    sys.path.insert(0, r"C:\Users\kraken\openptxas")
+    from sass.pipeline import compile_ptx_source  # type: ignore
+    result = compile_ptx_source(ptx_text)
+    if isinstance(result, dict):
+        return result
+    raise RuntimeError("compile_ptx_source did not return a dict")
+
+
 def compile_ptxas(ptx_path: Path) -> bytes:
     with tempfile.TemporaryDirectory() as tmp:
         cubin = Path(tmp) / "k.cubin"
@@ -117,6 +130,115 @@ def compare_kernel(ptx_path: Path) -> dict:
     return out
 
 
+_ENTRY_RE = re.compile(
+    r"^\s*(?:\.visible\s+)?\.entry\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+
+
+def _split_ptx_entries(ptx_text: str) -> list[tuple[str, str]]:
+    """Split a (possibly multi-`.entry`) PTX source into one
+    (entry_name, single_entry_ptx_text) pair per kernel.  Each text
+    contains the original module-level preamble (`.version`, `.target`,
+    `.address_size`) followed by exactly one `.entry` block.
+
+    For single-entry input, returns a one-element list with the original
+    text unchanged so the byte-for-byte ptxas behavior is identical to
+    the pre-split path.
+
+    Forge-emitted PTX has no shared `.global`/`.func` symbols across
+    entries (verified for the vortex_ntt corpus), so per-entry isolation
+    is sound.  If that assumption is violated by a future emitter
+    change, ptxas will surface an undefined-symbol error and the row's
+    `ptxas_err` will flag it — easy to triage."""
+    lines = ptx_text.splitlines(keepends=True)
+    entry_starts: list[tuple[int, str]] = []
+    for i, ln in enumerate(lines):
+        m = _ENTRY_RE.match(ln)
+        if m:
+            entry_starts.append((i, m.group(1)))
+    if len(entry_starts) <= 1:
+        name = entry_starts[0][1] if entry_starts else ""
+        return [(name, ptx_text)]
+
+    preamble = "".join(lines[:entry_starts[0][0]])
+    out: list[tuple[str, str]] = []
+    for idx, (start, name) in enumerate(entry_starts):
+        next_start = (entry_starts[idx + 1][0]
+                      if idx + 1 < len(entry_starts) else len(lines))
+        end_line = next_start - 1
+        for j in range(start, next_start):
+            if lines[j].startswith("}"):
+                end_line = j
+                break
+        body = "".join(lines[start:end_line + 1])
+        out.append((name, preamble + body))
+    return out
+
+
+def _compare_one(ptx_text: str, display_name: str) -> dict:
+    """Run the openptxas-vs-ptxas comparison for a single PTX text
+    (which must have exactly one `.entry`).  Result dict has the same
+    shape as `compare_kernel`'s, but with `name = display_name`."""
+    out: dict = {"name": display_name,
+                 "ptx_size": len(ptx_text.encode("utf-8")),
+                 "ours_err": None, "ptxas_err": None}
+    try:
+        ours_cubin = compile_openptxas(ptx_text)
+        out["ours_cubin_size"] = len(ours_cubin)
+    except Exception as e:
+        out["ours_err"] = f"{type(e).__name__}: {str(e)[:200]}"
+        return out
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".ptx", mode="w",
+                                          delete=False,
+                                          encoding="utf-8") as f:
+            f.write(ptx_text)
+            tmp_ptx = Path(f.name)
+        try:
+            ptxas_cubin = compile_ptxas(tmp_ptx)
+        finally:
+            tmp_ptx.unlink(missing_ok=True)
+        out["ptxas_cubin_size"] = len(ptxas_cubin)
+    except Exception as e:
+        out["ptxas_err"] = f"{type(e).__name__}: {str(e)[:200]}"
+        return out
+
+    out["byte_match"] = (ours_cubin == ptxas_cubin)
+    ours_sass = dump_sass(ours_cubin)
+    ptxas_sass = dump_sass(ptxas_cubin)
+    out["ours_n"] = instr_count(ours_sass)
+    out["ptxas_n"] = instr_count(ptxas_sass)
+    ours_hist = opcode_histogram(ours_sass)
+    ptxas_hist = opcode_histogram(ptxas_sass)
+    out["ours_unique_opcodes"] = sorted(set(ours_hist) - set(ptxas_hist))
+    out["ptxas_unique_opcodes"] = sorted(set(ptxas_hist) - set(ours_hist))
+    diff_counts: dict = {}
+    for op in set(ours_hist) | set(ptxas_hist):
+        o, p = ours_hist.get(op, 0), ptxas_hist.get(op, 0)
+        if o != p:
+            diff_counts[op] = (o, p)
+    out["opcode_deltas"] = diff_counts
+    return out
+
+
+def compare_kernel_per_entry(ptx_path: Path) -> list[dict]:
+    """Per-entry-aware sibling of `compare_kernel`.
+
+    For single-`.entry` PTX, returns a one-element list whose row
+    matches what `compare_kernel` produces (display name = file stem).
+    For multi-`.entry` PTX, returns one row per entry with display name
+    `<stem>:<entry>` so each kernel is classified individually instead
+    of being collapsed (the original `compile_openptxas` returns a
+    per-kernel dict but the legacy call path picked only the first
+    kernel's cubin, producing misleading MAJOR_DIFF verdicts).
+    """
+    ptx_text = ptx_path.read_text(encoding="utf-8")
+    entries = _split_ptx_entries(ptx_text)
+    if len(entries) <= 1:
+        return [_compare_one(ptx_text, ptx_path.stem)]
+    return [_compare_one(sub_text, f"{ptx_path.stem}:{name}")
+            for name, sub_text in entries]
+
+
 def verdict(r: dict) -> str:
     """Classify the comparison.  We expect openptxas and ptxas to land
     on equivalent SASS for production code; meaningful differences
@@ -146,7 +268,7 @@ def main():
     ptx_files = sorted(Path(args.ptx_dir).glob("*.ptx"))
     rows = []
     for p in ptx_files:
-        rows.append(compare_kernel(p))
+        rows.extend(compare_kernel_per_entry(p))
 
     out = []
     out.append(f"# Forge kernel codegen comparison — "
