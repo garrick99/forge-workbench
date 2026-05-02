@@ -242,13 +242,16 @@ class ProbeDB:
     # ---- probe insert ----
 
     # Columns that are *always* refreshable: re-running a probe gives a
-    # fresh measurement.  On UNIQUE conflict (same template_id+ptx_sha),
-    # we UPDATE these from the new run if they were NULL on the old row.
-    # This is what backfills perf-oracle timings into rows that were
-    # inserted by older code that didn't measure them.  Correctness
-    # fields (target_byte_match, gpu_correct, target_*_raw, etc.) are
-    # NOT in this set: they're a function of cubin bytes, which are
-    # already keyed by ptx_sha, so re-measuring is a no-op.
+    # fresh measurement.  On UNIQUE conflict (same template_id+ptx_sha):
+    # if the new run produced a DIFFERENT ours_cubin (ours_cubin_sha
+    # changed — meaning openptxas now emits different SASS for the same
+    # PTX), we UNCONDITIONALLY overwrite the timing columns so perf
+    # fixes show up in the data.  If the cubin sha is unchanged, we
+    # COALESCE (only fill NULLs) to avoid jitter on stable measurements.
+    #
+    # Without the cubin-sha-aware overwrite, perf fixes would be invisible:
+    # rows recorded before the fix (with old SASS) keep their stale
+    # timings even after openptxas regenerated to different bytes.
     _BACKFILL_COLS = (
         "ours_runtime_ms_mean", "ours_runtime_ms_min", "ours_runtime_ms_max",
         "ptxas_runtime_ms_mean", "ptxas_runtime_ms_min", "ptxas_runtime_ms_max",
@@ -256,21 +259,35 @@ class ProbeDB:
 
     def insert_probe(self, row: dict) -> int:
         """Insert a probe row.  Returns probe_id.  On UNIQUE conflict
-        (template_id, ptx_sha), backfills perf-oracle timing columns
-        from the new row when the existing row has them NULL — so a
-        mower running new code can fill in timings for rows inserted
-        by older code without disturbing correctness fields."""
+        (template_id, ptx_sha), refresh perf-oracle timing columns:
+        unconditional overwrite when ours_cubin_sha differs from the
+        prior row (cubin regenerated → re-measure); COALESCE-only-on-NULL
+        when cubin sha is unchanged (stable measurement, avoid jitter)."""
         cols = sorted(row.keys())
         placeholders = ",".join("?" for _ in cols)
         col_list = ",".join(cols)
-        # Build the ON CONFLICT clause: only UPDATE backfill cols, and
-        # only when the existing value is NULL (don't overwrite a
-        # measurement with a different one — single-source-of-truth
-        # for any one row).
         backfill_present = [c for c in self._BACKFILL_COLS if c in row]
         if backfill_present:
+            # CASE expression: when stored ours_cubin_sha != incoming
+            # ours_cubin_sha, take the new value; otherwise COALESCE.
             update_clauses = ", ".join(
-                f"{c} = COALESCE({c}, excluded.{c})" for c in backfill_present)
+                f"{c} = CASE WHEN probes.ours_cubin_sha IS NOT NULL "
+                f"AND probes.ours_cubin_sha <> excluded.ours_cubin_sha "
+                f"THEN excluded.{c} "
+                f"ELSE COALESCE({c}, excluded.{c}) END"
+                for c in backfill_present)
+            # Also refresh ours_cubin_sha + ours_compile_ms when the
+            # incoming cubin differs, so future conflict checks see the
+            # latest cubin sha as the baseline.
+            update_clauses += (
+                ", ours_cubin_sha = CASE WHEN excluded.ours_cubin_sha "
+                "IS NOT NULL THEN excluded.ours_cubin_sha "
+                "ELSE ours_cubin_sha END"
+                ", ours_compile_ms = CASE WHEN probes.ours_cubin_sha IS NOT NULL "
+                "AND probes.ours_cubin_sha <> excluded.ours_cubin_sha "
+                "THEN excluded.ours_compile_ms "
+                "ELSE COALESCE(ours_compile_ms, excluded.ours_compile_ms) END"
+            )
             sql = (f"INSERT INTO probes ({col_list}) "
                    f"VALUES ({placeholders}) "
                    f"ON CONFLICT(template_id, ptx_sha) "
