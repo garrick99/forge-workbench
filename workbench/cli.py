@@ -5284,7 +5284,8 @@ def _cmd_probe_watch(args):
             db = ProbeDB(edges_dir)
             cooldown = max(0, int(args.retry_after_hours))
             new_rows = db.query(
-                "SELECT edge_id, target_op, template_id, severity, title "
+                "SELECT edge_id, target_op, template_id, severity, title, "
+                "       related_bug "
                 "FROM edge_cases "
                 # Only dispatch on edges that need work.  Skip
                 # 'resolved-pending-verify' — fix already landed, just
@@ -5314,7 +5315,7 @@ def _cmd_probe_watch(args):
                   f"{new_edges_total}) ***")
             with open(punch_list_path, "a", encoding="utf-8") as f:
                 f.write(f"\n# probe-watch cycle #{cycle} @ {ts}\n")
-                for eid, op, tmpl, sev, title in new_rows:
+                for eid, op, tmpl, sev, title, _bug in new_rows:
                     line = (f"edge_{eid}  [{sev or 'medium':6}]  "
                             f"{op:32}  {tmpl:18}  {title}")
                     f.write(line + "\n")
@@ -5409,21 +5410,65 @@ def _cmd_probe_watch(args):
                     db.close()
                     return [r[0] for r in rows]
 
-                queue = [eid for eid, _, _, _, _ in new_rows]
+                # Cluster-aware queue: group by related_bug so we rotate
+                # ACROSS clusters per cycle instead of grinding the same
+                # cluster.  Within a cluster, verify-between-dispatches
+                # catches duplicate-shape siblings for free.  Across
+                # clusters, rotation maximizes the number of distinct
+                # bug shapes addressed per cycle.
+                # new_rows is already sorted (newly-filed first, then
+                # severity DESC, then edge_id).  Group preserving order.
+                from collections import OrderedDict as _OD, deque as _deque
+                clusters: "_OD[str, list[int]]" = _OD()
+                for eid, _op, _tmpl, _sev, _title, bug in new_rows:
+                    key = bug or f"_solo_{eid}"   # solo bugs each get their own cluster
+                    clusters.setdefault(key, []).append(eid)
+                # deque so we can rotate (popleft + append) per pick;
+                # this is what makes the rotation actually rotate.
+                cluster_keys = _deque(clusters.keys())
+                queue = [eid for eid, _, _, _, _, _ in new_rows]
+
                 if cap is not None:
                     print(f"  dispatching up to {cap} of {len(queue)} edges "
+                          f"across {len(cluster_keys)} cluster(s) "
                           f"(serial+verify={serial_with_verify}, "
                           f"max-concurrent={max_par})")
                 else:
                     print(f"  dispatching {len(queue)} fix agent(s) "
+                          f"across {len(cluster_keys)} cluster(s) "
                           f"(serial+verify={serial_with_verify}, "
                           f"max-concurrent={max_par})")
+
+                def _next_cluster_pick() -> int | None:
+                    """Round-robin: pop the front cluster, look up its
+                    first dispatchable edge, push the cluster to the
+                    back of the deque so the NEXT call picks from a
+                    different cluster.  Returns None when no cluster
+                    has anything left."""
+                    n_to_check = len(cluster_keys)
+                    for _ in range(n_to_check):
+                        key = cluster_keys.popleft()
+                        bucket = clusters[key]
+                        # drop already-resolved edges from this bucket
+                        while bucket and bucket[0] not in queue:
+                            bucket.pop(0)
+                        if bucket:
+                            eid = bucket.pop(0)
+                            queue.remove(eid)
+                            # rotate this cluster to the back so the
+                            # next pick comes from a different one
+                            if bucket:   # only re-queue if it still has work
+                                cluster_keys.append(key)
+                            return eid
+                        # bucket empty — don't re-queue (drops cluster)
+                    return None
 
                 if serial_with_verify:
                     # Re-verify before each dispatch; resolved-by-side-effect
                     # edges drop out of the queue for free.
                     n_dispatched = 0
-                    while queue:
+                    cluster_cursor = 0
+                    while True:
                         if cap is not None and n_dispatched >= cap:
                             print(f"    cap {cap} reached; "
                                   f"{len(queue)} edge(s) deferred to next cycle")
@@ -5433,21 +5478,39 @@ def _cmd_probe_watch(args):
                         if n_dispatched > 0:
                             _run_verify()
                             queue = _still_open(queue)
+                            # also prune cluster buckets so picks stay valid
+                            for k in cluster_keys:
+                                clusters[k] = [e for e in clusters[k]
+                                               if e in queue]
                             if not queue:
                                 print(f"    queue drained by verify after "
                                       f"{n_dispatched} dispatch(es)")
                                 break
-                        eid = queue.pop(0)
+                        # Round-robin cluster pick (rotates across
+                        # cluster_keys via clusters dict ordering;
+                        # within a cluster, severity-sorted top first).
+                        eid = _next_cluster_pick()
+                        if eid is None:
+                            break
                         eid, rc, tail = _run_dispatch(eid)
                         marker = "OK" if rc == 0 else f"FAIL({rc})"
                         print(f"    dispatch edge_{eid}: {marker}  {tail}")
                         n_dispatched += 1
                 else:
-                    # Parallel: cap-truncate, submit all, no verify-between.
+                    # Parallel: cluster-rotated queue (one rep per
+                    # cluster, then a second pass if cap allows),
+                    # cap-truncated, submitted to a ThreadPool.  No
+                    # verify-between in parallel mode.
+                    rotated: list[int] = []
+                    while True:
+                        eid = _next_cluster_pick()
+                        if eid is None:
+                            break
+                        rotated.append(eid)
                     if cap is not None:
-                        queue = queue[:cap]
+                        rotated = rotated[:cap]
                     with _cf.ThreadPoolExecutor(max_workers=max_par) as pool:
-                        futs = [pool.submit(_run_dispatch, eid) for eid in queue]
+                        futs = [pool.submit(_run_dispatch, eid) for eid in rotated]
                         for fut in _cf.as_completed(futs):
                             eid, rc, tail = fut.result()
                             marker = "OK" if rc == 0 else f"FAIL({rc})"
@@ -9622,12 +9685,16 @@ def main():
                                "from validation gates manageable)")
     p_pwatch.add_argument("--max-dispatches-per-cycle", type=int, default=None,
                           help="cap the number of fix agents launched per "
-                               "cycle.  Excess edges remain 'open' and the "
-                               "next cycle picks them up (combined with "
-                               "--verify-cmd, side-effect fixes from this "
-                               "cycle's dispatches will resolve some of "
-                               "the deferred edges for free).  Default: "
-                               "unlimited.  Recommended: 2.")
+                               "cycle.  The dispatch loop is cluster-aware: "
+                               "edges are grouped by related_bug and the "
+                               "loop rotates ACROSS clusters per cycle, so "
+                               "dispatching N edges with this cap means N "
+                               "DISTINCT bug shapes get attention rather "
+                               "than N attempts at the same shape (whose "
+                               "siblings would be caught by --verify-cmd "
+                               "for free anyway).  Default: unlimited.  "
+                               "Recommended: 4 — that's enough to attack a "
+                               "diverse queue without burning compute.")
     p_pwatch.add_argument("--verify-cmd", default=None,
                           help="shell command to run between sequential "
                                "dispatches to harvest side-effect "
