@@ -4817,6 +4817,101 @@ def _cmd_probe_loop(args):
     return 0
 
 
+def _file_forge_anomalies(forge_ptx_dir: str, edges_db_path: str) -> int:
+    """Scan a Forge-emitted PTX directory via the kernel comparator,
+    file each OURS_FAILED / PTXAS_FAILED / persistent MAJOR_DIFF kernel
+    as an edge_case (category='forge') in the edges DB.  Dedup against
+    ALL statuses (per the same discipline as openptxas edges) so
+    classified Forge bugs don't re-file every cycle.
+
+    Returns the number of newly-filed edges.
+    """
+    import json as _json
+    import os as _os
+    import time as _time
+    from pathlib import Path as _Path
+    from workbench.probe import ProbeDB
+
+    sys.path.insert(0, str(_Path(__file__).parent.parent / "tools"))
+    try:
+        import forge_kernel_compare as fkc  # type: ignore
+    except ImportError:
+        # tools/ not importable — caller must add it.  Fall back to no-op.
+        print(f"  forge anomaly filer: tools/forge_kernel_compare.py not "
+              f"importable; skipping")
+        return 0
+
+    ptx_files = sorted(_Path(forge_ptx_dir).glob("*.ptx"))
+    if not ptx_files:
+        return 0
+
+    edges_path = _os.path.abspath(edges_db_path)
+    edges_dir = (_os.path.dirname(edges_path) if edges_path.endswith(".sqlite")
+                 else edges_path)
+    edges = ProbeDB(edges_dir)
+
+    # Dedup: kernel name → already filed?  Use target_op as the kernel
+    # name slot (forge edges are keyed on (kernel_name, "forge_kernel")).
+    existing = set()
+    for op, tmpl in edges.query(
+        "SELECT target_op, template_id FROM edge_cases "
+        "WHERE template_id = ?", ("forge_kernel",)
+    ):
+        existing.add(op)
+
+    n_filed = 0
+    ts = _time.strftime("%Y-%m-%dT%H:%M:%S")
+    for p in ptx_files:
+        if p.stem in existing:
+            continue
+        try:
+            r = fkc.compare_kernel(p)
+        except Exception as e:
+            print(f"  forge {p.stem}: compare raised {type(e).__name__}: {e}")
+            continue
+        v = fkc.verdict(r)
+        if v in ("BYTE_MATCH", "EQUIVALENT", "MINOR_DIFF"):
+            continue   # not a bug
+        # Severity: ours-side failures are blocking; ptxas-side is high
+        # (it's a Forge emitter bug we own); MAJOR_DIFF is medium until
+        # someone confirms it's a real codegen problem.
+        sev = ("blocker" if v == "OURS_FAILED" else
+               "high" if v == "PTXAS_FAILED" else "medium")
+        err_summary = (r.get("ours_err") or r.get("ptxas_err")
+                       or f"verdict={v}, ours_n={r.get('ours_n')}, "
+                          f"ptxas_n={r.get('ptxas_n')}")
+        operand_spec = _json.dumps({
+            "kernel_file": str(p),
+            "kernel_name": p.stem,
+            "verdict": v,
+            "ours_size": r.get("ours_size"),
+            "ours_n": r.get("ours_n"),
+            "ptxas_n": r.get("ptxas_n"),
+            "error": err_summary[:200],
+        })
+        edges.add_edge_case(
+            category="forge",
+            title=f"Forge anomaly: {p.stem} ({v})",
+            description=(f"forge_kernel_compare classified `{p.stem}` as "
+                         f"{v} on {ts}.  Detail: {err_summary}\n\n"
+                         f"Source PTX: {p}\n"
+                         f"This is a Forge emitter bug (or downstream "
+                         f"openptxas bug for OURS_FAILED) — fix in the "
+                         f"appropriate repo, regenerate the PTX, and "
+                         f"verify via tools/forge_kernel_compare.py."),
+            target_op=p.stem,
+            template_id="forge_kernel",
+            operand_spec=operand_spec,
+            severity=sev,
+            related_bug="forge-corpus",
+            notes=f"auto-filed by _file_forge_anomalies at {ts}",
+        )
+        n_filed += 1
+        print(f"  forge anomaly filed: edge for {p.stem} ({v}, {sev})")
+    edges.close()
+    return n_filed
+
+
 def _file_single_mode_clusters(data_db_path: str, edges_db_path: str,
                                max_age_hours: int | None = None) -> int:
     """Single-DB anomaly scan: find gpu_incorrect probe clusters in
@@ -5136,6 +5231,20 @@ def _cmd_probe_watch(args):
                                            max_age_hours=args.max_age_hours)
             except Exception as e:
                 print(f"  single-db scan failed: {e}")
+
+            # If --forge-corpus-dir is set, also file Forge emitter
+            # anomalies (OURS_FAILED, PTXAS_FAILED, MAJOR_DIFF) as
+            # category='forge' edges in the same edges_db.  They land
+            # AFTER pre_max was captured, so the dispatch loop below
+            # picks them up via the standard newly-filed query.
+            if args.forge_corpus_dir:
+                try:
+                    n_forge = _file_forge_anomalies(args.forge_corpus_dir,
+                                                    args.edges_db)
+                    if n_forge:
+                        print(f"  forge anomalies filed: {n_forge}")
+                except Exception as e:
+                    print(f"  forge anomaly filer failed: {e}")
         else:
             # Run probe-harvest-pair as a subprocess to keep this watcher's
             # state clean — failures in the harvest don't crash the loop.
@@ -5310,6 +5419,124 @@ def _cmd_probe_watch(args):
     return 0
 
 
+def _emit_forge_autofix_prompt(args, eid, title, description, target_op,
+                                template_id, operand_spec_json, severity,
+                                status, notes):
+    """Build a Forge-tailored autofix prompt for an edge_case with
+    category='forge'.  Forge bugs have a different shape than openptxas
+    bugs: the kernel that fails is a checked-in artifact; the fix lives
+    in OCaml emitter code; validation is rebuild + regen + ptxas-accept
+    + forge_kernel_compare; commit pattern is split (codegen + regen
+    outputs as separate commits per the existing Forge convention)."""
+    import json as _json
+    forge_repo = r"C:\Users\kraken\forge"
+    fkc_tool = r"C:\Users\kraken\forge-workbench\tools\forge_kernel_compare.py"
+    try:
+        ospec = _json.loads(operand_spec_json) if operand_spec_json else {}
+    except Exception:
+        ospec = {}
+    kernel_file = ospec.get("kernel_file", "")
+    kernel_name = ospec.get("kernel_name", target_op or "")
+    verdict = ospec.get("verdict", "?")
+    err = ospec.get("error", "")
+
+    L: list[str] = []
+    L.append(f"# Autonomous fix request: edge_{eid} — Forge emitter")
+    L.append("")
+    L.append(f"You are fixing **Forge** at `{forge_repo}` — the upstream "
+             f"compiler that emits PTX consumed by openptxas.  A Forge-"
+             f"emitted kernel currently fails to compile or has divergent "
+             f"codegen.")
+    L.append("")
+    L.append("## Bug summary")
+    L.append(f"- **Kernel**: `{kernel_name}`")
+    L.append(f"- **Source PTX**: `{kernel_file}`")
+    L.append(f"- **Verdict**: `{verdict}` (severity: `{severity}`)")
+    if err:
+        L.append(f"- **Error**: `{err}`")
+    L.append("")
+    if description:
+        L.append("## Description")
+        L.append(description.strip())
+        L.append("")
+    L.append("## Repro")
+    L.append("```")
+    L.append(f'"/c/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.2/bin/ptxas.exe" -arch sm_120 "{kernel_file}" -o /tmp/check.cubin')
+    L.append("```")
+    L.append("")
+    L.append("Or via the comparator:")
+    L.append("```")
+    L.append(f'PYTHONPATH=C:\\Users\\kraken\\openptxas;C:\\Users\\kraken\\forge-workbench python "{fkc_tool}" --ptx-dir C:\\Users\\kraken\\forge\\analysis\\vortex_ntt')
+    L.append("```")
+    L.append("")
+    L.append("## Where to look")
+    L.append(f"Forge is a dune-managed OCaml project.  The PTX emitter lives in `lib/codegen/`.  Start with:")
+    L.append("```")
+    L.append(f'cd {forge_repo}')
+    L.append('grep -rn "<keyword from error>" lib/ bin/ --include="*.ml" --include="*.mli"')
+    L.append("```")
+    L.append(f"Examples of past Forge emitter fixes (use as pattern hints): commit `a10a957` resolved a span+explicit-`_len` parameter collision via an `emit_param` dedup check.")
+    L.append("")
+    L.append("## Validate + commit (Forge convention: split codegen and regen)")
+    L.append("After fixing, rebuild Forge and regenerate the kernel outputs:")
+    L.append("```")
+    L.append(f'cd {forge_repo}')
+    L.append("./build.sh    # or: dune build")
+    L.append("# regenerate the PTX corpus (consult Forge's existing build target for analysis/vortex_ntt/)")
+    L.append("```")
+    L.append("")
+    L.append(f'Verify ptxas accepts the new `{kernel_name}.ptx`:')
+    L.append("```")
+    L.append(f'"/c/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.2/bin/ptxas.exe" -arch sm_120 "{kernel_file}" -o /tmp/check.cubin')
+    L.append("# exit 0 = success")
+    L.append("```")
+    L.append("")
+    L.append("Verify the wider corpus didn't regress:")
+    L.append("```")
+    L.append(f'PYTHONPATH=C:\\Users\\kraken\\openptxas;C:\\Users\\kraken\\forge-workbench python "{fkc_tool}" --ptx-dir C:\\Users\\kraken\\forge\\analysis\\vortex_ntt')
+    L.append(f"# `{kernel_name}` should now show BYTE_MATCH or MAJOR_DIFF")
+    L.append("# No previously-BYTE_MATCH kernel may regress.")
+    L.append("```")
+    L.append("")
+    L.append("Run Forge tests if any:")
+    L.append("```")
+    L.append(f'cd {forge_repo} && dune runtest')
+    L.append("```")
+    L.append("")
+    L.append("Commit + push (split per Forge convention — codegen alone, then regen outputs):")
+    L.append("```")
+    L.append(f'cd {forge_repo}')
+    L.append("git add lib/codegen/<the-ml-file>.ml")
+    L.append('git commit -m "<area>: <one-line summary of the codegen fix>"')
+    L.append("git add analysis/ demos/")
+    L.append('git commit -m "regenerated outputs: <one-line referencing the codegen fix>"')
+    L.append("git push origin main")
+    L.append("```")
+    L.append("")
+    L.append("## Hard constraints")
+    L.append("- Do NOT modify the .ptx file directly.  Fix the emitter; regenerate.")
+    L.append("- Do NOT skip Forge tests.")
+    L.append("- Do NOT touch openptxas, forge-workbench, or any test outside Forge's own.")
+    L.append("- Minimum delta — surgical fix in the emitter, not a refactor.")
+    L.append("- Two commits, not one: keep the codegen fix attributable separate from the regen churn.")
+    L.append(f"- If you can't find the emitter site cleanly within 15 minutes, **report what you found and stop** rather than shipping a guess.")
+    L.append("")
+    L.append("## Done criterion")
+    L.append(f"`{kernel_name}.ptx` regenerates cleanly, ptxas accepts it (or "
+             f"the verdict moves toward BYTE_MATCH), the rest of the Forge "
+             f"corpus doesn't regress, and two small commits land in the "
+             f"Forge repo.")
+
+    text = "\n".join(L) + "\n"
+    if args.output:
+        from pathlib import Path
+        Path(args.output).write_text(text, encoding="utf-8")
+        print(f"wrote {args.output} ({len(text)} chars)", file=sys.stderr)
+    else:
+        sys.stdout.write(text)
+    return 0
+
+
 def _cmd_probe_autofix(args):
     """Generate a self-contained agent prompt to fix an edge_case
     end-to-end.
@@ -5431,6 +5658,12 @@ def _cmd_probe_autofix(args):
 
     repo = os.path.abspath(args.openptxas_repo)
     probe_dir = os.path.abspath(args.probe_dir)
+
+    # ---- Branch on category: forge edges get a different prompt ----
+    if category == "forge":
+        return _emit_forge_autofix_prompt(
+            args, eid, title, description, target_op, template_id,
+            operand_spec_json, severity, status, notes)
 
     # ---- Build the prompt ----
     L = []
@@ -9365,6 +9598,15 @@ def main():
     p_pwatch.add_argument("--verify-timeout", type=int, default=180,
                           help="seconds before aborting --verify-cmd "
                                "(default: 180)")
+    p_pwatch.add_argument("--forge-corpus-dir", default=None,
+                          help="(single-db mode) directory of Forge-emitted "
+                               ".ptx files to also scan for emitter bugs.  "
+                               "Each OURS_FAILED / PTXAS_FAILED / MAJOR_DIFF "
+                               "kernel becomes a category='forge' edge_case "
+                               "that the standard dispatch path picks up "
+                               "with a Forge-tailored prompt template.  "
+                               "Recommended: C:\\Users\\kraken\\forge\\"
+                               "analysis\\vortex_ntt")
     p_pwatch.add_argument("--max-age-hours", type=int, default=None,
                           help="(single-db mode) only file clusters whose "
                                "canonical probe is within the last N hours.  "
