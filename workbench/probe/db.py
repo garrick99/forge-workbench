@@ -118,7 +118,13 @@ CREATE TABLE IF NOT EXISTS edge_cases (
     status           TEXT DEFAULT 'open', -- 'open' | 'investigating' |
                                           -- 'resolved' | 'wontfix'
     related_bug      TEXT,             -- e.g., "FG29-multi-body-reg" tag
-    notes            TEXT              -- free-form, accumulates over time
+    notes            TEXT,             -- free-form, accumulates over time
+    last_dispatched_at TEXT             -- ISO ts of most-recent dispatch
+                                       -- attempt (NULL = never dispatched).
+                                       -- probe-watch's dispatch query uses
+                                       -- this to retry stuck-open edges
+                                       -- after a cooldown without
+                                       -- re-dispatching every cycle.
 );
 CREATE INDEX IF NOT EXISTS ix_edge_status ON edge_cases(status);
 CREATE INDEX IF NOT EXISTS ix_edge_category ON edge_cases(category);
@@ -210,6 +216,16 @@ class ProbeDB:
             if col not in existing:
                 self.conn.execute(
                     f"ALTER TABLE probes ADD COLUMN {col} {ty}")
+
+        # edge_cases.last_dispatched_at — added 2026-05-01 so probe-watch
+        # can dispatch proactively-filed and reopened edges after a
+        # cooldown, instead of being limited to in-cycle-filed edges
+        # via the prior `edge_id > pre_max` query.
+        cur = self.conn.execute("PRAGMA table_info(edge_cases)")
+        existing_e = {row[1] for row in cur.fetchall()}
+        if "last_dispatched_at" not in existing_e:
+            self.conn.execute(
+                "ALTER TABLE edge_cases ADD COLUMN last_dispatched_at TEXT")
 
     # ---- content store ----
 

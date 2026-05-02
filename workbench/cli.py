@@ -5271,19 +5271,42 @@ def _cmd_probe_watch(args):
                 time.sleep(interval)
                 continue
 
-        # Pull newly-filed edges from edges DB
+        # Pull dispatchable edges from edges DB.  Two cases:
+        #   (a) edges newly filed in this cycle (edge_id > pre_max)
+        #   (b) older 'open' edges with no dispatch history yet, OR
+        #       whose last dispatch was > --retry-after-hours ago.
+        # Without (b), proactively-filed edges (e.g. unimplemented-PTX
+        # follow-ups, reverify_resolved-spawned regression edges) and
+        # reopened edges sit forever because pre_max is captured at
+        # cycle start.  With (b), they enter the queue but get a
+        # cooldown so we don't hammer hard-to-fix bugs every hour.
         try:
             db = ProbeDB(edges_dir)
+            cooldown = max(0, int(args.retry_after_hours))
             new_rows = db.query(
                 "SELECT edge_id, target_op, template_id, severity, title "
-                "FROM edge_cases WHERE edge_id > ? AND status IN "
-                "('open','investigating','resolved-pending-verify') "
-                "ORDER BY edge_id",
-                (pre_max,))
+                "FROM edge_cases "
+                # Only dispatch on edges that need work.  Skip
+                # 'resolved-pending-verify' — fix already landed, just
+                # waiting for the cross-machine verify; re-dispatching
+                # would be wasteful.  Skip 'resolved' and 'wontfix' —
+                # already classified.
+                "WHERE status IN ('open', 'investigating') "
+                "  AND ("
+                "    last_dispatched_at IS NULL "
+                "    OR last_dispatched_at < datetime('now', ?) "
+                "  ) "
+                "ORDER BY "
+                "  CASE WHEN edge_id > ? THEN 0 ELSE 1 END, "  # newly-filed first
+                "  CASE severity "                              # then severity DESC
+                "    WHEN 'blocker' THEN 0 WHEN 'high' THEN 1 "
+                "    WHEN 'medium'  THEN 2 ELSE 3 END, "
+                "  edge_id",
+                (f"-{cooldown} hours", pre_max))
             db.close()
         except Exception as e:
             new_rows = []
-            print(f"  could not query newly-filed edges: {e}")
+            print(f"  could not query dispatchable edges: {e}")
 
         if new_rows:
             new_edges_total += len(new_rows)
@@ -5322,7 +5345,27 @@ def _cmd_probe_watch(args):
                 cap = args.max_dispatches_per_cycle
                 serial_with_verify = (max_par == 1 and args.verify_cmd)
 
+                def _stamp_dispatched(eid: int) -> None:
+                    """Mark edge as just-dispatched so the cooldown query
+                    won't re-pick it for another --retry-after-hours."""
+                    try:
+                        db2 = ProbeDB(edges_dir)
+                        db2.conn.execute(
+                            "UPDATE edge_cases SET last_dispatched_at = ? "
+                            "WHERE edge_id = ?",
+                            (time.strftime("%Y-%m-%dT%H:%M:%S"), eid))
+                        db2.conn.commit()
+                        db2.close()
+                    except Exception as _e:
+                        print(f"    [warn] could not stamp last_dispatched_at "
+                              f"for edge_{eid}: {_e}")
+
                 def _run_dispatch(eid: int) -> tuple[int, int, str]:
+                    # Stamp BEFORE running so a crash mid-dispatch still
+                    # records the attempt (cooldown protects against
+                    # tight-loop dispatch on a session that consistently
+                    # crashes).
+                    _stamp_dispatched(eid)
                     cmd_str = args.dispatch_cmd.replace("{eid}", str(eid))
                     if "{eid}" not in args.dispatch_cmd:
                         cmd_str = f"{args.dispatch_cmd} {eid}"
@@ -9607,6 +9650,14 @@ def main():
                                "with a Forge-tailored prompt template.  "
                                "Recommended: C:\\Users\\kraken\\forge\\"
                                "analysis\\vortex_ntt")
+    p_pwatch.add_argument("--retry-after-hours", type=int, default=24,
+                          help="cooldown before re-dispatching an already-"
+                               "tried 'open' edge (default: 24).  Combined "
+                               "with the new last_dispatched_at column, "
+                               "this lets the loop pick up proactively-"
+                               "filed edges (filed outside probe-watch's "
+                               "in-cycle window) and retry stuck-open ones, "
+                               "without hammering them every hour.")
     p_pwatch.add_argument("--max-age-hours", type=int, default=None,
                           help="(single-db mode) only file clusters whose "
                                "canonical probe is within the last N hours.  "
